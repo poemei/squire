@@ -1,12 +1,14 @@
 # [AI: GPT-5.6 Sol | 2026-10-03 | Human approval pending]
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -D_POSIX_C_SOURCE=200809L
-CPPFLAGS ?= -Iincludes
-LDFLAGS ?=
+ABI_DIR ?= ../ABI
+CPPFLAGS ?= -Iincludes -I$(ABI_DIR)/includes
+LDFLAGS ?= -ldl
 
 TARGET := build/squire
-SOURCES := src/main.c src/log.c src/config.c
+SOURCES := src/main.c src/log.c src/config.c src/modules.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
+ABI_OBJECTS := build/abi.o build/abi_module.o build/abi_registry.o build/abi_loader_linux.o
 
 PREFIX ?= /opt/squire
 BINDIR := $(PREFIX)/bin
@@ -28,8 +30,20 @@ build:
 build/%.o: src/%.c includes/squire.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(TARGET): $(OBJECTS)
-	$(CC) $(OBJECTS) $(LDFLAGS) -o $@
+build/abi.o: $(ABI_DIR)/src/abi.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+build/abi_module.o: $(ABI_DIR)/src/module.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+build/abi_registry.o: $(ABI_DIR)/src/module_registry.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+build/abi_loader_linux.o: $(ABI_DIR)/src/loader_linux.c | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(TARGET): $(OBJECTS) $(ABI_OBJECTS)
+	$(CC) $(OBJECTS) $(ABI_OBJECTS) $(LDFLAGS) -o $@
 
 install: $(TARGET)
 	install -d $(BINDIR) $(CONFIGDIR) $(LOGDIR) $(MODULEDIR) $(RAGDIR) $(STATEDIR)
