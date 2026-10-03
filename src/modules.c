@@ -374,22 +374,39 @@ static int squire_tracking_commit(const char *module_id,
 static void squire_module_cleanup_failed(const char *module_id)
 {
     const stnlabz_module_record_t *record;
+    stnlabz_module_result_t lifecycle_result;
+    char detail[256];
 
     if (module_id == NULL || module_id[0] == '\0') {
         return;
     }
 
     record = stnlabz_module_registry_find(&squire_registry, module_id);
-    if (record != NULL) {
-        if (record->state == STNLABZ_MODULE_STATE_ACTIVE) {
-            (void)stnlabz_module_abi_stop(&squire_registry, module_id);
-        } else if (record->state != STNLABZ_MODULE_STATE_FAILED &&
-                   record->state != STNLABZ_MODULE_STATE_QUARANTINED &&
-                   record->state != STNLABZ_MODULE_STATE_STOPPED) {
+    if (record != NULL && record->state == STNLABZ_MODULE_STATE_ACTIVE) {
+        lifecycle_result = stnlabz_module_abi_stop(&squire_registry, module_id);
+        if (lifecycle_result != STNLABZ_MODULE_OK) {
             (void)stnlabz_module_registry_fail(&squire_registry, module_id);
         }
+    }
 
-        (void)stnlabz_module_abi_unregister(&squire_registry, module_id);
+    record = stnlabz_module_registry_find(&squire_registry, module_id);
+    if (record != NULL &&
+        record->state != STNLABZ_MODULE_STATE_FAILED &&
+        record->state != STNLABZ_MODULE_STATE_QUARANTINED &&
+        record->state != STNLABZ_MODULE_STATE_STOPPED) {
+        (void)stnlabz_module_registry_fail(&squire_registry, module_id);
+    }
+
+    record = stnlabz_module_registry_find(&squire_registry, module_id);
+    if (record != NULL) {
+        lifecycle_result = stnlabz_module_abi_unregister(&squire_registry, module_id);
+        if (lifecycle_result != STNLABZ_MODULE_OK) {
+            snprintf(detail,
+                     sizeof(detail),
+                     "failed module cleanup could not unregister record: %s",
+                     stnlabz_module_result_string(lifecycle_result));
+            squire_audit_event("MODULE_LOAD_FAIL", "FAILURE", module_id, "unknown", detail);
+        }
     }
 
     (void)stnlabz_module_loader_unload(&squire_loader, module_id);
@@ -482,6 +499,88 @@ static int squire_module_load_one(const char *module_id,
     squire_audit_event("MODULE_LOAD_SUCCESS", "SUCCESS", descriptor->id, version,
                        "module qualified, authorized, and active");
     return 0;
+}
+
+static int squire_module_recover_known_good(const char *module_id, const char *live_path)
+{
+    const stnlabz_loaded_module_t *loaded;
+    squire_tracked_module *tracked;
+    char rollback_path[SQUIRE_PATH_MAX];
+    char unused_candidate_path[SQUIRE_PATH_MAX];
+    char detail[512];
+    off_t active_size;
+    off_t rejected_size;
+    time_t active_mtime;
+    time_t rejected_mtime;
+
+    if (module_id == NULL || live_path == NULL) {
+        return -1;
+    }
+
+    if (squire_ensure_state_directory(module_id,
+                                      rollback_path,
+                                      sizeof(rollback_path),
+                                      unused_candidate_path,
+                                      sizeof(unused_candidate_path)) != 0) {
+        return -1;
+    }
+
+    if (squire_file_fingerprint(rollback_path, &active_size, &active_mtime) != 0) {
+        return 0;
+    }
+
+    squire_module_cleanup_failed(module_id);
+
+    squire_audit_event("MODULE_ROLLBACK_BEGIN", "BEGIN", module_id, "unknown",
+                       "startup recovery from last known-good module snapshot");
+
+    if (squire_module_load_one(module_id, rollback_path, 0) != 0) {
+        squire_audit_event("MODULE_ROLLBACK_FAIL", "FAILURE", module_id, "unknown",
+                           "last known-good module snapshot failed startup recovery");
+        return -1;
+    }
+
+    loaded = stnlabz_module_loader_find(&squire_loader, module_id);
+    if (loaded == NULL || loaded->descriptor == NULL) {
+        squire_audit_event("MODULE_ROLLBACK_FAIL", "FAILURE", module_id, "unknown",
+                           "recovered module descriptor unavailable");
+        squire_module_cleanup_failed(module_id);
+        return -1;
+    }
+
+    tracked = squire_tracking_find(module_id);
+    if (tracked == NULL) {
+        tracked = squire_tracking_allocate();
+    }
+
+    if (tracked == NULL) {
+        squire_audit_event("MODULE_ROLLBACK_FAIL", "FAILURE", module_id, "unknown",
+                           "no Core tracking slot available for recovered module");
+        squire_module_cleanup_failed(module_id);
+        return -1;
+    }
+
+    snprintf(tracked->id, sizeof(tracked->id), "%s", module_id);
+    snprintf(tracked->live_path, sizeof(tracked->live_path), "%s", live_path);
+    snprintf(tracked->rollback_path, sizeof(tracked->rollback_path), "%s", rollback_path);
+    squire_module_version(loaded->descriptor, tracked->version, sizeof(tracked->version));
+    tracked->active_size = active_size;
+    tracked->active_mtime = active_mtime;
+
+    if (squire_file_fingerprint(live_path, &rejected_size, &rejected_mtime) == 0) {
+        tracked->rejected_valid = 1;
+        tracked->rejected_size = rejected_size;
+        tracked->rejected_mtime = rejected_mtime;
+    } else {
+        tracked->rejected_valid = 0;
+    }
+
+    snprintf(detail,
+             sizeof(detail),
+             "known-good version=%s restored; installed candidate retained only for future replacement detection",
+             tracked->version);
+    squire_audit_event("MODULE_ROLLBACK_SUCCESS", "SUCCESS", module_id, tracked->version, detail);
+    return 1;
 }
 
 static int squire_module_path_from_directory(const char *root,
@@ -867,6 +966,8 @@ int squire_modules_load_directory(const char *directory)
     }
 
     while ((entry = readdir(dir)) != NULL) {
+        int recovery_result;
+
         if (!squire_module_path_from_directory(directory,
                                                entry->d_name,
                                                module_id,
@@ -878,6 +979,12 @@ int squire_modules_load_directory(const char *directory)
 
         candidates++;
         if (squire_module_load_one(module_id, path, 1) == 0) {
+            loaded++;
+            continue;
+        }
+
+        recovery_result = squire_module_recover_known_good(module_id, path);
+        if (recovery_result > 0) {
             loaded++;
         }
     }
