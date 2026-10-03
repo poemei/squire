@@ -3,7 +3,7 @@
  * Squire IRC transport module.
  *
  * Core owns module lifecycle audit. IRC transport diagnostics are written
- * separately to /opt/squire/logs/irc.log. Inbound PRIVMSG lines are retained
+ * separately to /opt/squire/logs/irc.log. Inbound PRIVMSG content is retained
  * for doctrine/RAG inspection. Credentials and SASL payloads are never logged.
  */
 #include "module.h"
@@ -24,8 +24,8 @@
 #include <unistd.h>
 
 #define SQUIRE_IRC_VERSION_MAJOR 0
-#define SQUIRE_IRC_VERSION_MINOR 2
-#define SQUIRE_IRC_VERSION_PATCH 4
+#define SQUIRE_IRC_VERSION_MINOR 3
+#define SQUIRE_IRC_VERSION_PATCH 0
 
 #define IRC_CONFIG_PATH "/opt/squire/config/irc.conf"
 #define IRC_LOG_PATH "/opt/squire/logs/irc.log"
@@ -33,6 +33,8 @@
 #define IRC_LINE_MAX 1024
 #define IRC_SASL_RAW_MAX 768
 #define IRC_SASL_B64_MAX 1024
+#define IRC_SENDER_MAX 128
+#define IRC_MESSAGE_MAX 512
 
 typedef struct irc_config {
     char server[IRC_TEXT_MAX];
@@ -44,6 +46,12 @@ typedef struct irc_config {
     char realname[IRC_TEXT_MAX];
     unsigned int reconnect_seconds;
 } irc_config;
+
+typedef struct irc_privmsg {
+    char sender[IRC_SENDER_MAX];
+    char target[IRC_TEXT_MAX];
+    char message[IRC_MESSAGE_MAX];
+} irc_privmsg;
 
 static int irc_started = 0;
 static volatile int irc_stop_requested = 0;
@@ -133,6 +141,21 @@ static int irc_copy_text(char *destination, size_t destination_size, const char 
     return 0;
 }
 
+static int irc_copy_span(char *destination,
+                         size_t destination_size,
+                         const char *start,
+                         size_t length)
+{
+    if (destination == NULL || destination_size == 0 || start == NULL ||
+        length == 0 || length >= destination_size) {
+        return -1;
+    }
+
+    memcpy(destination, start, length);
+    destination[length] = '\0';
+    return 0;
+}
+
 static char *irc_trim(char *text)
 {
     char *end;
@@ -200,7 +223,7 @@ static int irc_load_config(const char *path, irc_config *config)
 
     memset(config, 0, sizeof(*config));
     config->port = 6697;
-    config->reconnect_seconds = 10;
+    config->reconnect_seconds = 180;
 
     file = fopen(path, "r");
     if (file == NULL) {
@@ -242,7 +265,7 @@ static int irc_load_config(const char *path, irc_config *config)
         } else if (strcmp(key, "realname") == 0) {
             if (irc_copy_text(config->realname, sizeof(config->realname), value) != 0) goto invalid;
         } else if (strcmp(key, "reconnect_seconds") == 0) {
-            if (irc_parse_uint(value, 1, 300, &config->reconnect_seconds) != 0) goto invalid;
+            if (irc_parse_uint(value, 1, 3600, &config->reconnect_seconds) != 0) goto invalid;
         } else {
             goto invalid;
         }
@@ -395,9 +418,73 @@ static int irc_build_sasl_plain(const irc_config *config,
     return 0;
 }
 
-static int irc_line_is_privmsg(const char *line)
+static int irc_parse_privmsg(const char *line, irc_privmsg *message)
 {
-    return line != NULL && strstr(line, " PRIVMSG ") != NULL;
+    const char *prefix_start;
+    const char *prefix_end;
+    const char *sender_end;
+    const char *command;
+    const char *target_start;
+    const char *target_end;
+    const char *message_start;
+
+    if (line == NULL || message == NULL || line[0] != ':') {
+        return -1;
+    }
+
+    memset(message, 0, sizeof(*message));
+    prefix_start = line + 1;
+    prefix_end = strchr(prefix_start, ' ');
+    if (prefix_end == NULL) {
+        return -1;
+    }
+
+    command = prefix_end + 1;
+    if (strncmp(command, "PRIVMSG ", 8) != 0) {
+        return -1;
+    }
+
+    sender_end = strchr(prefix_start, '!');
+    if (sender_end == NULL || sender_end > prefix_end) {
+        sender_end = prefix_end;
+    }
+
+    target_start = command + 8;
+    target_end = strchr(target_start, ' ');
+    if (target_end == NULL || target_end == target_start) {
+        return -1;
+    }
+
+    if (target_end[1] != ':' || target_end[2] == '\0') {
+        return -1;
+    }
+    message_start = target_end + 2;
+
+    if (irc_copy_span(message->sender,
+                      sizeof(message->sender),
+                      prefix_start,
+                      (size_t)(sender_end - prefix_start)) != 0 ||
+        irc_copy_span(message->target,
+                      sizeof(message->target),
+                      target_start,
+                      (size_t)(target_end - target_start)) != 0 ||
+        irc_copy_text(message->message,
+                      sizeof(message->message),
+                      message_start) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int irc_sasl_failure_numeric(const char *line)
+{
+    if (line == NULL) return 0;
+    if (strstr(line, " 904 ") != NULL) return 904;
+    if (strstr(line, " 905 ") != NULL) return 905;
+    if (strstr(line, " 906 ") != NULL) return 906;
+    if (strstr(line, " 907 ") != NULL) return 907;
+    return 0;
 }
 
 static int irc_handle_session(SSL *ssl, const irc_config *config)
@@ -461,8 +548,14 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
 
             line_buffer[line_used] = '\0';
 
-            if (irc_line_is_privmsg(line_buffer)) {
-                irc_log("PRIVMSG %s", line_buffer);
+            {
+                irc_privmsg privmsg;
+                if (irc_parse_privmsg(line_buffer, &privmsg) == 0) {
+                    irc_log("PRIVMSG sender=%s target=%s message=%s",
+                            privmsg.sender,
+                            privmsg.target,
+                            privmsg.message);
+                }
             }
 
             if (strncmp(line_buffer, "PING ", 5) == 0) {
@@ -518,12 +611,12 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 }
             }
 
-            if (strstr(line_buffer, " 904 ") != NULL ||
-                strstr(line_buffer, " 905 ") != NULL ||
-                strstr(line_buffer, " 906 ") != NULL ||
-                strstr(line_buffer, " 907 ") != NULL) {
-                irc_log("SASL_FAIL");
-                return -1;
+            {
+                int sasl_failure = irc_sasl_failure_numeric(line_buffer);
+                if (sasl_failure != 0) {
+                    irc_log("SASL_FAIL numeric=%d", sasl_failure);
+                    return -1;
+                }
             }
 
             if (strstr(line_buffer, " 001 ") != NULL) {
@@ -672,6 +765,7 @@ static int irc_negative_probe(const void *value)
 static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t *result)
 {
     irc_config probe;
+    irc_privmsg parsed_message;
     unsigned int parsed = 0;
     char encoded[128];
 
@@ -685,21 +779,29 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
     (void)irc_copy_text(probe.server, sizeof(probe.server), "irc.libera.chat");
     probe.port = 6697;
     (void)irc_copy_text(probe.channel, sizeof(probe.channel), "##rosaic");
-    (void)irc_copy_text(probe.nick, sizeof(probe.nick), "Squire");
+    (void)irc_copy_text(probe.nick, sizeof(probe.nick), "squire");
     (void)irc_copy_text(probe.account, sizeof(probe.account), "squire");
     (void)irc_copy_text(probe.password, sizeof(probe.password), "qualification-only");
     (void)irc_copy_text(probe.realname, sizeof(probe.realname), "Squire Rosaic Information Agent");
-    probe.reconnect_seconds = 10;
+    probe.reconnect_seconds = 180;
 
     irc_test(strcmp("irc", "irc") == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MAJOR == 0, result);
-    irc_test(SQUIRE_IRC_VERSION_MINOR == 2, result);
-    irc_test(SQUIRE_IRC_VERSION_PATCH == 4, result);
+    irc_test(SQUIRE_IRC_VERSION_MINOR == 3, result);
+    irc_test(SQUIRE_IRC_VERSION_PATCH == 0, result);
     irc_test(irc_parse_uint("6697", 1, 65535, &parsed) == 0 && parsed == 6697, result);
     irc_test(irc_parse_uint("0", 1, 65535, &parsed) != 0, result);
-    irc_test(irc_copy_text(probe.nick, sizeof(probe.nick), "Squire") == 0, result);
+    irc_test(irc_copy_text(probe.nick, sizeof(probe.nick), "squire") == 0, result);
     irc_test(irc_config_valid(&probe), result);
     irc_test(irc_build_sasl_plain(&probe, encoded, sizeof(encoded)) == 0 && encoded[0] != '\0', result);
+    irc_test(irc_parse_privmsg(":Poe!user@example PRIVMSG ##rosaic :hello Squire",
+                               &parsed_message) == 0 &&
+             strcmp(parsed_message.sender, "Poe") == 0 &&
+             strcmp(parsed_message.target, "##rosaic") == 0 &&
+             strcmp(parsed_message.message, "hello Squire") == 0,
+             result);
+    irc_test(irc_parse_privmsg("PING :server", &parsed_message) != 0, result);
+    irc_test(irc_sasl_failure_numeric(":server 904 squire :SASL failed") == 904, result);
     irc_test(!irc_started && irc_socket_fd == -1, result);
 
     result->negative_test_executed = 1;
@@ -727,7 +829,7 @@ static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
         return STNLABZ_MODULE_ERR_START_FAILED;
     }
 
-    irc_log("START version=0.2.4 config=%s", IRC_CONFIG_PATH);
+    irc_log("START version=0.3.0 config=%s", IRC_CONFIG_PATH);
     irc_stop_requested = 0;
     irc_set_current_socket(-1);
 
