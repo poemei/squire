@@ -83,15 +83,15 @@ int main(int argc, char **argv)
 
     if (squire_install_signal_handlers() != 0) {
         squire_log("ERROR", "CORE_SIGNAL_HANDLER_INSTALL_FAILED");
-        squire_audit("CORE_START_FAILURE", "FAILURE", "core", SQUIRE_VERSION,
-                     "unable to install signal handlers");
+        squire_audit_event("CORE_START_FAILURE", "FAILURE", "core", SQUIRE_VERSION,
+                           "unable to install signal handlers");
         squire_log_close();
         return EXIT_FAILURE;
     }
 
     squire_logf("INFO", "CORE_START name=%s version=%s pid=%ld", SQUIRE_NAME, SQUIRE_VERSION, (long)getpid());
-    squire_audit("CORE_START", "SUCCESS", "core", SQUIRE_VERSION,
-                 "Core process initialized");
+    squire_audit_event("CORE_START", "SUCCESS", "core", SQUIRE_VERSION,
+                       "Core process initialized");
     squire_logf("INFO", "CONFIG_LOADED path=%s", config_path);
 
     while (squire_running) {
@@ -101,8 +101,8 @@ int main(int argc, char **argv)
     squire_logf("INFO", "CORE_STOP_REQUEST signal=%s(%d)",
                 squire_signal_name((int)squire_stop_signal),
                 (int)squire_stop_signal);
-    squire_audit("CORE_STOP", "SUCCESS", "core", SQUIRE_VERSION,
-                 squire_signal_name((int)squire_stop_signal));
+    squire_audit_event("CORE_STOP", "SUCCESS", "core", SQUIRE_VERSION,
+                       squire_signal_name((int)squire_stop_signal));
     squire_log("INFO", "CORE_STOP_COMPLETE");
     squire_log_close();
 
