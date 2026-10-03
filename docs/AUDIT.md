@@ -30,6 +30,9 @@ The following events are reserved for module lifecycle auditing:
 - `MODULE_ROLLBACK_BEGIN`
 - `MODULE_ROLLBACK_SUCCESS`
 - `MODULE_ROLLBACK_FAIL`
+- `MODULE_RECONCILE_BEGIN`
+- `MODULE_RECONCILE_SUCCESS`
+- `MODULE_RECONCILE_FAIL`
 
 ## Required Fields
 
@@ -52,6 +55,26 @@ Each audit event records:
 ```text
 2026-10-03T10:30:00-0700 [AUDIT] event="MODULE_HOTLOAD_SUCCESS" status="SUCCESS" subject="irc" version="0.1.0" detail="qualification passed; module activated"
 ```
+
+## Hot Reconcile
+
+A running Squire Core may receive `SIGHUP` to reconcile the configured module directory without restarting Core.
+
+The module directory contract is:
+
+```text
+/opt/squire/modules/<module>/<module>.so
+```
+
+During reconcile:
+
+1. A previously unseen module is treated as a hot-load candidate.
+2. A changed binary for an active module is treated as an update candidate.
+3. Core stages the candidate under `/opt/squire/state/modules/<module>/` before replacing the active revision.
+4. The previous qualified revision remains available as the known-good rollback binary until the candidate has qualified and activated successfully.
+5. A failed candidate is rolled back to the previous known-good revision when possible.
+6. A rejected candidate fingerprint is remembered for the current Core process so the same unchanged failing file is not repeatedly retried on each `SIGHUP`.
+7. `/opt/squire/modules` remains operator-managed. Core rollback does not require write access to the live module directory.
 
 ## Audit Rules
 
