@@ -30,14 +30,14 @@ $(TARGET): $(SOURCE) | $(BUILD_DIR)
 
 install: $(TARGET)
 	install -d $(INSTALL_DIR) $(CONFIG_DIR)
-	install -m 0755 $(TARGET) $(INSTALL_TEMP)
-	mv -f $(INSTALL_TEMP) $(INSTALL_TARGET)
 	@if [ ! -f $(CONFIG_TARGET) ]; then \
 		install -m 0640 $(CONFIG_EXAMPLE) $(CONFIG_TARGET); \
 		echo "Installed default $(CONFIG_TARGET); set the Libera account password before expecting authentication."; \
 	else \
 		echo "Preserving existing $(CONFIG_TARGET)"; \
 	fi
+	install -m 0755 $(TARGET) $(INSTALL_TEMP)
+	mv -f $(INSTALL_TEMP) $(INSTALL_TARGET)
 	@echo "Installed $(MODULE) 0.2.0 to $(INSTALL_TARGET)"
 
 uninstall:
