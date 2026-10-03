@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static stnlabz_module_loader_t squire_loader;
 static stnlabz_module_registry_t squire_registry;
@@ -102,27 +103,70 @@ static void squire_module_version(const stnlabz_module_descriptor_t *descriptor,
              descriptor->version_patch);
 }
 
-static int squire_module_candidate(const char *filename, char *module_id, size_t module_id_size)
+static int squire_name_is_shared_object(const char *name)
 {
     size_t length;
-    size_t id_length;
 
-    if (filename == NULL || module_id == NULL || module_id_size == 0) {
+    if (name == NULL) {
         return 0;
     }
 
-    length = strlen(filename);
-    if (length <= 3 || strcmp(filename + length - 3, ".so") != 0) {
+    length = strlen(name);
+    return length > 3 && strcmp(name + length - 3, ".so") == 0;
+}
+
+static int squire_module_directory_candidate(const char *root,
+                                             const char *entry_name,
+                                             char *module_id,
+                                             size_t module_id_size,
+                                             char *module_path,
+                                             size_t module_path_size)
+{
+    struct stat st;
+    char directory_path[SQUIRE_PATH_MAX];
+
+    if (root == NULL || entry_name == NULL || module_id == NULL ||
+        module_path == NULL || module_id_size == 0 || module_path_size == 0) {
         return 0;
     }
 
-    id_length = length - 3;
-    if (id_length == 0 || id_length >= module_id_size || id_length >= STNLABZ_MODULE_ID_MAX) {
+    if (entry_name[0] == '\0' || entry_name[0] == '.') {
         return 0;
     }
 
-    memcpy(module_id, filename, id_length);
-    module_id[id_length] = '\0';
+    if (strlen(entry_name) >= module_id_size || strlen(entry_name) >= STNLABZ_MODULE_ID_MAX) {
+        return 0;
+    }
+
+    if (snprintf(directory_path, sizeof(directory_path), "%s/%s", root, entry_name) >=
+        (int)sizeof(directory_path)) {
+        return 0;
+    }
+
+    if (stat(directory_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+
+    snprintf(module_id, module_id_size, "%s", entry_name);
+
+    if (snprintf(module_path,
+                 module_path_size,
+                 "%s/%s/%s.so",
+                 root,
+                 module_id,
+                 module_id) >= (int)module_path_size) {
+        return 0;
+    }
+
+    if (stat(module_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        squire_audit_event("MODULE_REJECTED",
+                           "FAILURE",
+                           module_id,
+                           "unknown",
+                           "module directory must contain <module>/<module>.so");
+        return 0;
+    }
+
     return 1;
 }
 
@@ -234,7 +278,7 @@ int squire_modules_load_directory(const char *directory)
     unsigned int candidates = 0;
     unsigned int loaded = 0;
     char module_id[STNLABZ_MODULE_ID_MAX];
-    char path[SQUIRE_PATH_MAX];
+    char module_path[SQUIRE_PATH_MAX];
 
     if (directory == NULL || directory[0] == '\0') {
         return -1;
@@ -254,18 +298,30 @@ int squire_modules_load_directory(const char *directory)
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        if (!squire_module_candidate(entry->d_name, module_id, sizeof(module_id))) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+
+        if (squire_name_is_shared_object(entry->d_name)) {
+            squire_audit_event("MODULE_REJECTED",
+                               "FAILURE",
+                               entry->d_name,
+                               "unknown",
+                               "flat module files are not permitted; expected <module>/<module>.so");
+            continue;
+        }
+
+        if (!squire_module_directory_candidate(directory,
+                                               entry->d_name,
+                                               module_id,
+                                               sizeof(module_id),
+                                               module_path,
+                                               sizeof(module_path))) {
             continue;
         }
 
         candidates++;
-        if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) >= (int)sizeof(path)) {
-            squire_audit_event("MODULE_REJECTED", "FAILURE", module_id, "unknown",
-                               "module path exceeds Core path limit");
-            continue;
-        }
-
-        if (squire_module_load_one(module_id, path) == 0) {
+        if (squire_module_load_one(module_id, module_path) == 0) {
             loaded++;
         }
     }
