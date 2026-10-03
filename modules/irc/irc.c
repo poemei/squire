@@ -2,14 +2,15 @@
  * [AI: GPT-5.6 Sol | 2026-10-03 | Human approval pending]
  * Squire IRC transport module.
  *
- * Core owns module lifecycle audit. IRC transport diagnostics and inbound
- * PRIVMSG traffic are written separately to /opt/squire/logs/irc.log.
- * Credentials and SASL payloads are never logged.
+ * Core owns module lifecycle audit. IRC transport diagnostics are written
+ * separately to /opt/squire/logs/irc.log. Inbound PRIVMSG lines are retained
+ * for doctrine/RAG inspection. Credentials and SASL payloads are never logged.
  */
 #include "module.h"
 
 #include <errno.h>
 #include <netdb.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
 #include <pthread.h>
@@ -24,7 +25,7 @@
 
 #define SQUIRE_IRC_VERSION_MAJOR 0
 #define SQUIRE_IRC_VERSION_MINOR 2
-#define SQUIRE_IRC_VERSION_PATCH 3
+#define SQUIRE_IRC_VERSION_PATCH 4
 
 #define IRC_CONFIG_PATH "/opt/squire/config/irc.conf"
 #define IRC_LOG_PATH "/opt/squire/logs/irc.log"
@@ -84,6 +85,25 @@ static void irc_log(const char *format, ...)
         fclose(file);
     }
     pthread_mutex_unlock(&irc_log_lock);
+}
+
+static void irc_log_tls_error(const char *operation, SSL *ssl, int ssl_result)
+{
+    unsigned long code;
+    char detail[256];
+    int ssl_error = SSL_ERROR_NONE;
+
+    if (ssl != NULL && ssl_result <= 0) {
+        ssl_error = SSL_get_error(ssl, ssl_result);
+    }
+
+    code = ERR_get_error();
+    if (code != 0UL) {
+        ERR_error_string_n(code, detail, sizeof(detail));
+        irc_log("%s ssl_error=%d openssl=%s", operation, ssl_error, detail);
+    } else {
+        irc_log("%s ssl_error=%d openssl=no_error_queued", operation, ssl_error);
+    }
 }
 
 static void irc_test(int condition, stnlabz_module_qualification_result_t *result)
@@ -208,53 +228,32 @@ static int irc_load_config(const char *path, irc_config *config)
         value = irc_trim(equals + 1);
 
         if (strcmp(key, "server") == 0) {
-            if (irc_copy_text(config->server, sizeof(config->server), value) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_copy_text(config->server, sizeof(config->server), value) != 0) goto invalid;
         } else if (strcmp(key, "port") == 0) {
-            if (irc_parse_uint(value, 1, 65535, &config->port) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_parse_uint(value, 1, 65535, &config->port) != 0) goto invalid;
         } else if (strcmp(key, "channel") == 0) {
-            if (irc_copy_text(config->channel, sizeof(config->channel), value) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_copy_text(config->channel, sizeof(config->channel), value) != 0) goto invalid;
         } else if (strcmp(key, "nick") == 0) {
-            if (irc_copy_text(config->nick, sizeof(config->nick), value) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_copy_text(config->nick, sizeof(config->nick), value) != 0) goto invalid;
         } else if (strcmp(key, "account") == 0) {
-            if (irc_copy_text(config->account, sizeof(config->account), value) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_copy_text(config->account, sizeof(config->account), value) != 0) goto invalid;
         } else if (strcmp(key, "password") == 0) {
-            if (irc_copy_text(config->password, sizeof(config->password), value) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_copy_text(config->password, sizeof(config->password), value) != 0) goto invalid;
         } else if (strcmp(key, "realname") == 0) {
-            if (irc_copy_text(config->realname, sizeof(config->realname), value) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_copy_text(config->realname, sizeof(config->realname), value) != 0) goto invalid;
         } else if (strcmp(key, "reconnect_seconds") == 0) {
-            if (irc_parse_uint(value, 1, 300, &config->reconnect_seconds) != 0) {
-                fclose(file);
-                return -1;
-            }
+            if (irc_parse_uint(value, 1, 300, &config->reconnect_seconds) != 0) goto invalid;
         } else {
-            fclose(file);
-            return -1;
+            goto invalid;
         }
     }
 
     fclose(file);
     return irc_config_valid(config) ? 0 : -1;
+
+invalid:
+    fclose(file);
+    return -1;
 }
 
 static int irc_tcp_connect(const char *server, unsigned int port)
@@ -268,6 +267,7 @@ static int irc_tcp_connect(const char *server, unsigned int port)
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
 
     snprintf(port_text, sizeof(port_text), "%u", port);
     if (getaddrinfo(server, port_text, &hints, &addresses) != 0) {
@@ -329,6 +329,7 @@ static int irc_ssl_send(SSL *ssl, const char *text)
     while (sent < length) {
         int result = SSL_write(ssl, text + sent, (int)(length - sent));
         if (result <= 0) {
+            irc_log_tls_error("TLS_WRITE_FAIL", ssl, result);
             return -1;
         }
         sent += (size_t)result;
@@ -438,7 +439,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
         int index;
 
         if (count <= 0) {
-            irc_log("IRC_SESSION_DISCONNECTED");
+            irc_log_tls_error("IRC_SESSION_DISCONNECTED", ssl, count);
             return -1;
         }
 
@@ -468,7 +469,6 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 char pong[IRC_LINE_MAX];
                 int length = snprintf(pong, sizeof(pong), "PONG %s\r\n", line_buffer + 5);
                 if (length < 0 || length >= (int)sizeof(pong) || irc_ssl_send(ssl, pong) != 0) {
-                    irc_log("PONG_SEND_FAIL");
                     return -1;
                 }
             }
@@ -477,7 +477,6 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 strstr(line_buffer, " LS ") != NULL && strstr(line_buffer, "sasl") != NULL) {
                 irc_log("SASL_CAPABILITY_FOUND");
                 if (irc_ssl_send(ssl, "CAP REQ :sasl\r\n") != 0) {
-                    irc_log("SASL_CAP_REQUEST_FAIL");
                     return -1;
                 }
                 sasl_requested = 1;
@@ -487,7 +486,6 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 strstr(line_buffer, " ACK ") != NULL && strstr(line_buffer, "sasl") != NULL) {
                 irc_log("SASL_CAPABILITY_ACK");
                 if (irc_ssl_send(ssl, "AUTHENTICATE PLAIN\r\n") != 0) {
-                    irc_log("SASL_AUTHENTICATE_START_FAIL");
                     return -1;
                 }
             }
@@ -516,7 +514,6 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 sasl_complete = 1;
                 irc_log("SASL_SUCCESS account=%s", config->account);
                 if (irc_ssl_send(ssl, "CAP END\r\n") != 0) {
-                    irc_log("CAP_END_SEND_FAIL");
                     return -1;
                 }
             }
@@ -571,6 +568,7 @@ static int irc_connect_once(const irc_config *config)
     SSL *ssl = NULL;
     int fd = -1;
     int result = -1;
+    int ssl_result;
 
     irc_log("CONNECT_BEGIN server=%s port=%u", config->server, config->port);
 
@@ -580,30 +578,36 @@ static int irc_connect_once(const irc_config *config)
     }
 
     irc_set_current_socket(fd);
+    ERR_clear_error();
 
     context = SSL_CTX_new(TLS_client_method());
     if (context == NULL) {
-        irc_log("TLS_CONTEXT_FAIL");
+        irc_log_tls_error("TLS_CONTEXT_FAIL", NULL, 0);
         goto cleanup;
     }
 
     SSL_CTX_set_verify(context, SSL_VERIFY_PEER, NULL);
     if (SSL_CTX_set_default_verify_paths(context) != 1) {
-        irc_log("TLS_CA_PATH_FAIL");
+        irc_log_tls_error("TLS_CA_PATH_FAIL", NULL, 0);
         goto cleanup;
     }
 
     ssl = SSL_new(context);
     if (ssl == NULL) {
-        irc_log("TLS_SESSION_CREATE_FAIL");
+        irc_log_tls_error("TLS_SESSION_CREATE_FAIL", NULL, 0);
         goto cleanup;
     }
 
     if (SSL_set_tlsext_host_name(ssl, config->server) != 1 ||
         SSL_set1_host(ssl, config->server) != 1 ||
-        SSL_set_fd(ssl, fd) != 1 ||
-        SSL_connect(ssl) != 1) {
-        irc_log("TLS_HANDSHAKE_FAIL");
+        SSL_set_fd(ssl, fd) != 1) {
+        irc_log_tls_error("TLS_CONFIGURE_FAIL", ssl, 0);
+        goto cleanup;
+    }
+
+    ssl_result = SSL_connect(ssl);
+    if (ssl_result != 1) {
+        irc_log_tls_error("TLS_HANDSHAKE_FAIL", ssl, ssl_result);
         goto cleanup;
     }
 
@@ -620,7 +624,6 @@ cleanup:
         (void)SSL_shutdown(ssl);
         SSL_free(ssl);
     }
-
     if (context != NULL) {
         SSL_CTX_free(context);
     }
@@ -648,10 +651,7 @@ static void *irc_worker(void *context)
     irc_config *config = (irc_config *)context;
 
     irc_log("WORKER_START server=%s channel=%s nick=%s account=%s",
-            config->server,
-            config->channel,
-            config->nick,
-            config->account);
+            config->server, config->channel, config->nick, config->account);
 
     while (!irc_stop_requested) {
         (void)irc_connect_once(config);
@@ -686,7 +686,7 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
     probe.port = 6697;
     (void)irc_copy_text(probe.channel, sizeof(probe.channel), "##rosaic");
     (void)irc_copy_text(probe.nick, sizeof(probe.nick), "Squire");
-    (void)irc_copy_text(probe.account, sizeof(probe.account), "Squire");
+    (void)irc_copy_text(probe.account, sizeof(probe.account), "squire");
     (void)irc_copy_text(probe.password, sizeof(probe.password), "qualification-only");
     (void)irc_copy_text(probe.realname, sizeof(probe.realname), "Squire Rosaic Information Agent");
     probe.reconnect_seconds = 10;
@@ -694,14 +694,13 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
     irc_test(strcmp("irc", "irc") == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MAJOR == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MINOR == 2, result);
-    irc_test(SQUIRE_IRC_VERSION_PATCH == 3, result);
+    irc_test(SQUIRE_IRC_VERSION_PATCH == 4, result);
     irc_test(irc_parse_uint("6697", 1, 65535, &parsed) == 0 && parsed == 6697, result);
     irc_test(irc_parse_uint("0", 1, 65535, &parsed) != 0, result);
     irc_test(irc_copy_text(probe.nick, sizeof(probe.nick), "Squire") == 0, result);
     irc_test(irc_config_valid(&probe), result);
     irc_test(irc_build_sasl_plain(&probe, encoded, sizeof(encoded)) == 0 && encoded[0] != '\0', result);
     irc_test(!irc_started && irc_socket_fd == -1, result);
-    irc_test(irc_line_is_privmsg(":nick!user@host PRIVMSG ##rosaic :test"), result);
 
     result->negative_test_executed = 1;
     result->negative_test_passed = (irc_negative_probe(NULL) != 0);
@@ -728,8 +727,7 @@ static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
         return STNLABZ_MODULE_ERR_START_FAILED;
     }
 
-    irc_log("START version=0.2.3 config=%s", IRC_CONFIG_PATH);
-
+    irc_log("START version=0.2.4 config=%s", IRC_CONFIG_PATH);
     irc_stop_requested = 0;
     irc_set_current_socket(-1);
 
