@@ -6,6 +6,18 @@
 
 #include <string.h>
 
+#ifndef TEST_MODULE_VERSION_MAJOR
+#define TEST_MODULE_VERSION_MAJOR 0
+#endif
+
+#ifndef TEST_MODULE_VERSION_MINOR
+#define TEST_MODULE_VERSION_MINOR 1
+#endif
+
+#ifndef TEST_MODULE_VERSION_PATCH
+#define TEST_MODULE_VERSION_PATCH 0
+#endif
+
 static int test_started = 0;
 
 static stnlabz_module_result_t test_qualify(stnlabz_module_qualification_result_t *result)
@@ -20,6 +32,11 @@ static stnlabz_module_result_t test_qualify(stnlabz_module_qualification_result_
     result->tests_failed = 0;
     result->negative_test_executed = 1;
     result->negative_test_passed = 1;
+
+#ifdef TEST_MODULE_FORCE_QUALIFICATION_FAILURE
+    result->tests_passed = STNLABZ_MODULE_MIN_TESTS - 1;
+    result->tests_failed = 1;
+#endif
 
     return STNLABZ_MODULE_OK;
 }
@@ -49,9 +66,9 @@ static stnlabz_module_result_t test_stop(void)
 static const stnlabz_module_descriptor_t TEST_DESCRIPTOR = {
     "test_module",
     "Squire ABI Test Module",
-    0,
-    1,
-    0,
+    TEST_MODULE_VERSION_MAJOR,
+    TEST_MODULE_VERSION_MINOR,
+    TEST_MODULE_VERSION_PATCH,
     STNLABZ_MODULE_API_MAJOR,
     STNLABZ_MODULE_API_MINOR,
     test_qualify,
