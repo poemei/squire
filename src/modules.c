@@ -33,6 +33,7 @@ typedef struct squire_tracked_module {
 static stnlabz_module_loader_t squire_loader;
 static stnlabz_module_registry_t squire_registry;
 static squire_tracked_module squire_tracking[SQUIRE_TRACKED_MODULES];
+static unsigned long squire_candidate_sequence = 0;
 static int squire_modules_initialized = 0;
 
 static int squire_host_send_message(const char *message)
@@ -142,6 +143,58 @@ static int squire_file_fingerprint(const char *path, off_t *size, time_t *mtime)
     return 0;
 }
 
+static int squire_files_equal(const char *first_path, const char *second_path)
+{
+    FILE *first;
+    FILE *second;
+    unsigned char first_buffer[16384];
+    unsigned char second_buffer[16384];
+    size_t first_count;
+    size_t second_count;
+    int equal = 1;
+
+    if (first_path == NULL || second_path == NULL) {
+        return -1;
+    }
+
+    first = fopen(first_path, "rb");
+    if (first == NULL) {
+        return -1;
+    }
+
+    second = fopen(second_path, "rb");
+    if (second == NULL) {
+        fclose(first);
+        return -1;
+    }
+
+    for (;;) {
+        first_count = fread(first_buffer, 1, sizeof(first_buffer), first);
+        second_count = fread(second_buffer, 1, sizeof(second_buffer), second);
+
+        if (first_count != second_count) {
+            equal = 0;
+            break;
+        }
+
+        if (first_count == 0) {
+            if (ferror(first) || ferror(second)) {
+                equal = -1;
+            }
+            break;
+        }
+
+        if (memcmp(first_buffer, second_buffer, first_count) != 0) {
+            equal = 0;
+            break;
+        }
+    }
+
+    fclose(second);
+    fclose(first);
+    return equal;
+}
+
 static int squire_copy_file(const char *source, const char *destination)
 {
     FILE *input;
@@ -196,6 +249,7 @@ static int squire_ensure_state_directory(const char *module_id,
                                          size_t candidate_size)
 {
     char module_state_dir[SQUIRE_PATH_MAX];
+    unsigned long sequence;
 
     if (module_id == NULL || rollback_path == NULL || candidate_path == NULL) {
         return -1;
@@ -225,11 +279,14 @@ static int squire_ensure_state_directory(const char *module_id,
         return -1;
     }
 
+    sequence = ++squire_candidate_sequence;
     if (snprintf(candidate_path,
                  candidate_size,
-                 "%s/%s.candidate.so",
+                 "%s/%s.candidate.%ld.%lu.so",
                  module_state_dir,
-                 module_id) >= (int)candidate_size) {
+                 module_id,
+                 (long)getpid(),
+                 sequence) >= (int)candidate_size) {
         return -1;
     }
 
@@ -275,7 +332,7 @@ static int squire_tracking_commit(const char *module_id,
 {
     squire_tracked_module *tracked;
     char rollback_path[SQUIRE_PATH_MAX];
-    char candidate_path[SQUIRE_PATH_MAX];
+    char unused_candidate_path[SQUIRE_PATH_MAX];
     off_t size;
     time_t mtime;
 
@@ -286,12 +343,10 @@ static int squire_tracking_commit(const char *module_id,
     if (squire_ensure_state_directory(module_id,
                                       rollback_path,
                                       sizeof(rollback_path),
-                                      candidate_path,
-                                      sizeof(candidate_path)) != 0) {
+                                      unused_candidate_path,
+                                      sizeof(unused_candidate_path)) != 0) {
         return -1;
     }
-
-    (void)remove(candidate_path);
 
     if (squire_copy_file(live_path, rollback_path) != 0) {
         return -1;
@@ -626,6 +681,7 @@ static int squire_module_update(squire_tracked_module *tracked)
     char candidate_version[64];
     char new_version[64];
     char detail[512];
+    int equal_result;
 
     if (tracked == NULL) {
         return -1;
@@ -635,14 +691,41 @@ static int squire_module_update(squire_tracked_module *tracked)
         return -1;
     }
 
-    if (candidate_size == tracked->active_size && candidate_mtime == tracked->active_mtime) {
+    equal_result = squire_files_equal(tracked->live_path, tracked->rollback_path);
+    if (equal_result == 1) {
+        tracked->active_size = candidate_size;
+        tracked->active_mtime = candidate_mtime;
+        tracked->rejected_valid = 0;
         return 0;
+    }
+    if (equal_result < 0) {
+        return -1;
     }
 
     if (tracked->rejected_valid &&
         candidate_size == tracked->rejected_size &&
         candidate_mtime == tracked->rejected_mtime) {
         return 0;
+    }
+
+    if (squire_ensure_state_directory(tracked->id,
+                                      rollback_path,
+                                      sizeof(rollback_path),
+                                      candidate_path,
+                                      sizeof(candidate_path)) != 0 ||
+        squire_copy_file(tracked->live_path, candidate_path) != 0) {
+        squire_audit_event("MODULE_UPDATE_FAIL", "FAILURE", tracked->id, tracked->version,
+                           "unable to stage candidate binary in Core state");
+        return -1;
+    }
+
+    equal_result = squire_files_equal(tracked->live_path, candidate_path);
+    if (equal_result != 1) {
+        squire_logf("INFO",
+                    "MODULE_UPDATE_DEFERRED module=%s reason=source_changed_during_staging",
+                    tracked->id);
+        (void)remove(candidate_path);
+        return equal_result < 0 ? -1 : 0;
     }
 
     snprintf(old_version, sizeof(old_version), "%s", tracked->version);
@@ -652,17 +735,6 @@ static int squire_module_update(squire_tracked_module *tracked)
              old_version,
              tracked->live_path);
     squire_audit_event("MODULE_UPDATE_BEGIN", "BEGIN", tracked->id, old_version, detail);
-
-    if (squire_ensure_state_directory(tracked->id,
-                                      rollback_path,
-                                      sizeof(rollback_path),
-                                      candidate_path,
-                                      sizeof(candidate_path)) != 0 ||
-        squire_copy_file(tracked->live_path, candidate_path) != 0) {
-        squire_audit_event("MODULE_UPDATE_FAIL", "FAILURE", tracked->id, old_version,
-                           "unable to stage candidate binary in Core state");
-        return -1;
-    }
 
     if (squire_module_prequalify_candidate(tracked->id,
                                             candidate_path,
@@ -726,6 +798,17 @@ static int squire_module_update(squire_tracked_module *tracked)
     }
 
     squire_module_version(loaded->descriptor, new_version, sizeof(new_version));
+    if (strcmp(new_version, candidate_version) != 0) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "qualified_version=%s activated_version=%s; refusing inconsistent candidate",
+                 candidate_version,
+                 new_version);
+        squire_audit_event("MODULE_UPDATE_FAIL", "FAILURE", tracked->id, old_version, detail);
+        squire_module_cleanup_failed(tracked->id);
+        (void)remove(candidate_path);
+        return squire_module_rollback(tracked, candidate_size, candidate_mtime);
+    }
 
     if (rename(candidate_path, rollback_path) != 0) {
         squire_audit_event("MODULE_UPDATE_FAIL", "FAILURE", tracked->id, old_version,
