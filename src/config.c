@@ -37,6 +37,7 @@ void squire_config_defaults(squire_config *config)
     memset(config, 0, sizeof(*config));
     snprintf(config->log_path, sizeof(config->log_path), "%s", SQUIRE_DEFAULT_LOG);
     snprintf(config->log_level, sizeof(config->log_level), "%s", "INFO");
+    snprintf(config->module_dir, sizeof(config->module_dir), "%s", SQUIRE_DEFAULT_MODULE_DIR);
 }
 
 int squire_config_load(const char *path, squire_config *config)
@@ -85,6 +86,12 @@ int squire_config_load(const char *path, squire_config *config)
                 return -1;
             }
             snprintf(config->log_level, sizeof(config->log_level), "%s", value);
+        } else if (strcmp(key, "module_dir") == 0) {
+            if (*value == '\0' || strlen(value) >= sizeof(config->module_dir)) {
+                fclose(file);
+                return -1;
+            }
+            snprintf(config->module_dir, sizeof(config->module_dir), "%s", value);
         } else {
             fclose(file);
             return -1;
