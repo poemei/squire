@@ -346,8 +346,11 @@ stnlabz_module_result_t __wrap_stnlabz_module_abi_stop(
     result = __real_stnlabz_module_abi_stop(registry, module_id);
     squire_service_clear_owner();
 
-    /* Never leave a callable pointer into a module that Core may unload. */
-    (void)squire_service_remove_owner(module_id);
+    if (result == STNLABZ_MODULE_OK) {
+        /* Never leave a callable pointer into a module Core may now unload. */
+        (void)squire_service_remove_owner(module_id);
+    }
+
     return result;
 }
 
@@ -369,6 +372,9 @@ stnlabz_module_result_t __wrap_stnlabz_module_abi_prepare_replacement(
     result = __real_stnlabz_module_abi_prepare_replacement(registry, module_id);
     squire_service_clear_owner();
 
-    (void)squire_service_remove_owner(module_id);
+    if (result == STNLABZ_MODULE_OK) {
+        (void)squire_service_remove_owner(module_id);
+    }
+
     return result;
 }
