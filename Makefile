@@ -3,10 +3,13 @@ CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -D_POSIX_C_SOURCE=200809L
 ABI_DIR ?= ../ABI
 CPPFLAGS ?= -Iincludes -I$(ABI_DIR)/includes
-LDFLAGS ?= -ldl
+LDFLAGS ?= -ldl -lpthread \
+	-Wl,--wrap=stnlabz_module_abi_authorize_and_activate \
+	-Wl,--wrap=stnlabz_module_abi_stop \
+	-Wl,--wrap=stnlabz_module_abi_prepare_replacement
 
 TARGET := build/squire
-SOURCES := src/main.c src/log.c src/config.c src/modules.c
+SOURCES := src/main.c src/log.c src/config.c src/modules.c src/services.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 ABI_OBJECTS := build/abi.o build/abi_module.o build/abi_registry.o build/abi_loader_linux.o
 
