@@ -494,6 +494,87 @@ static int squire_module_path_from_directory(const char *root,
     return 1;
 }
 
+static int squire_module_prequalify_candidate(const char *module_id,
+                                               const char *candidate_path,
+                                               char *candidate_version,
+                                               size_t candidate_version_size)
+{
+    stnlabz_module_loader_t test_loader;
+    stnlabz_module_registry_t test_registry;
+    const stnlabz_module_descriptor_t *descriptor = NULL;
+    const stnlabz_module_record_t *record;
+    stnlabz_module_loader_result_t loader_result;
+    stnlabz_module_result_t lifecycle_result;
+    char detail[512];
+
+    if (module_id == NULL || candidate_path == NULL ||
+        candidate_version == NULL || candidate_version_size == 0) {
+        return -1;
+    }
+
+    stnlabz_module_loader_init(&test_loader);
+    stnlabz_module_registry_init(&test_registry);
+
+    loader_result = stnlabz_module_loader_load(&test_loader,
+                                                module_id,
+                                                candidate_path,
+                                                &descriptor);
+    if (loader_result != STNLABZ_MODULE_LOADER_OK || descriptor == NULL) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "candidate ABI load failed: %s",
+                 stnlabz_module_loader_result_string(loader_result));
+        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", module_id, "unknown", detail);
+        stnlabz_module_loader_unload_all(&test_loader);
+        return -1;
+    }
+
+    squire_module_version(descriptor, candidate_version, candidate_version_size);
+
+    if (descriptor->start == NULL || descriptor->stop == NULL) {
+        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", module_id, candidate_version,
+                           "candidate missing required start or stop callback");
+        stnlabz_module_loader_unload_all(&test_loader);
+        return -1;
+    }
+
+    squire_audit_event("MODULE_QUALIFICATION_BEGIN", "BEGIN", module_id, candidate_version,
+                       "Core initiated candidate qualification while current revision remains active");
+
+    lifecycle_result = stnlabz_module_abi_prepare(&test_registry, descriptor);
+    if (lifecycle_result != STNLABZ_MODULE_OK) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "candidate qualification failed: %s; current revision remains active",
+                 stnlabz_module_result_string(lifecycle_result));
+        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", module_id, candidate_version, detail);
+        (void)stnlabz_module_abi_unregister(&test_registry, module_id);
+        stnlabz_module_loader_unload_all(&test_loader);
+        return -1;
+    }
+
+    record = stnlabz_module_registry_find(&test_registry, module_id);
+    if (record == NULL) {
+        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", module_id, candidate_version,
+                           "candidate qualification record missing; current revision remains active");
+        stnlabz_module_loader_unload_all(&test_loader);
+        return -1;
+    }
+
+    snprintf(detail,
+             sizeof(detail),
+             "tests_executed=%u tests_passed=%u tests_failed=%u negative_test=%s; current revision still active",
+             record->qualification.tests_executed,
+             record->qualification.tests_passed,
+             record->qualification.tests_failed,
+             record->qualification.negative_test_passed ? "PASS" : "FAIL");
+    squire_audit_event("MODULE_QUALIFICATION_PASS", "SUCCESS", module_id, candidate_version, detail);
+
+    (void)stnlabz_module_abi_unregister(&test_registry, module_id);
+    stnlabz_module_loader_unload_all(&test_loader);
+    return 0;
+}
+
 static int squire_module_rollback(squire_tracked_module *tracked,
                                   off_t rejected_size,
                                   time_t rejected_mtime)
@@ -542,6 +623,7 @@ static int squire_module_update(squire_tracked_module *tracked)
     char candidate_path[SQUIRE_PATH_MAX];
     char rollback_path[SQUIRE_PATH_MAX];
     char old_version[64];
+    char candidate_version[64];
     char new_version[64];
     char detail[512];
 
@@ -560,8 +642,6 @@ static int squire_module_update(squire_tracked_module *tracked)
     if (tracked->rejected_valid &&
         candidate_size == tracked->rejected_size &&
         candidate_mtime == tracked->rejected_mtime) {
-        squire_logf("INFO", "MODULE_UPDATE_SKIPPED module=%s reason=rejected_candidate_unchanged",
-                    tracked->id);
         return 0;
     }
 
@@ -584,6 +664,29 @@ static int squire_module_update(squire_tracked_module *tracked)
         return -1;
     }
 
+    if (squire_module_prequalify_candidate(tracked->id,
+                                            candidate_path,
+                                            candidate_version,
+                                            sizeof(candidate_version)) != 0) {
+        tracked->rejected_valid = 1;
+        tracked->rejected_size = candidate_size;
+        tracked->rejected_mtime = candidate_mtime;
+        snprintf(detail,
+                 sizeof(detail),
+                 "candidate rejected; active version=%s retained",
+                 old_version);
+        squire_audit_event("MODULE_UPDATE_FAIL", "FAILURE", tracked->id, old_version, detail);
+        (void)remove(candidate_path);
+        return 0;
+    }
+
+    snprintf(detail,
+             sizeof(detail),
+             "old_version=%s candidate_version=%s qualification=PASS",
+             old_version,
+             candidate_version);
+    squire_audit_event("MODULE_HOTLOAD_BEGIN", "BEGIN", tracked->id, candidate_version, detail);
+
     lifecycle_result = stnlabz_module_abi_prepare_replacement(&squire_registry, tracked->id);
     if (lifecycle_result != STNLABZ_MODULE_OK) {
         snprintf(detail,
@@ -603,12 +706,12 @@ static int squire_module_update(squire_tracked_module *tracked)
                  stnlabz_module_loader_result_string(loader_result));
         squire_audit_event("MODULE_UPDATE_FAIL", "FAILURE", tracked->id, old_version, detail);
         (void)remove(candidate_path);
-        return -1;
+        return squire_module_rollback(tracked, candidate_size, candidate_mtime);
     }
 
     if (squire_module_load_one(tracked->id, candidate_path, 0) != 0) {
         squire_audit_event("MODULE_UPDATE_FAIL", "FAILURE", tracked->id, old_version,
-                           "candidate failed qualification or activation");
+                           "qualified candidate failed activation; rolling back known-good revision");
         (void)remove(candidate_path);
         return squire_module_rollback(tracked, candidate_size, candidate_mtime);
     }
@@ -643,6 +746,7 @@ static int squire_module_update(squire_tracked_module *tracked)
              "old_version=%s new_version=%s",
              old_version,
              new_version);
+    squire_audit_event("MODULE_HOTLOAD_SUCCESS", "SUCCESS", tracked->id, new_version, detail);
     squire_audit_event("MODULE_UPDATE_SUCCESS", "SUCCESS", tracked->id, new_version, detail);
     return 0;
 }
@@ -749,11 +853,10 @@ int squire_modules_reconcile_directory(const char *directory)
                 tracked = squire_tracking_find(module_id);
                 squire_audit_event("MODULE_HOTLOAD_SUCCESS", "SUCCESS", module_id,
                                    tracked != NULL ? tracked->version : "unknown",
-                                   "new module activated without Core restart");
+                                   "new module qualified and activated without Core restart");
             } else {
-                failures++;
                 squire_audit_event("MODULE_HOTLOAD_FAIL", "FAILURE", module_id, "unknown",
-                                   "new module failed qualification or activation");
+                                   "new module failed qualification or activation; Core continues");
             }
             continue;
         }
@@ -770,13 +873,16 @@ int squire_modules_reconcile_directory(const char *directory)
     }
 
     closedir(dir);
-    squire_logf("INFO",
-                "MODULE_RECONCILE_COMPLETE directory=%s candidates=%u hotloaded=%u updated=%u failures=%u",
-                directory,
-                candidates,
-                hotloaded,
-                updated,
-                failures);
+
+    if (hotloaded > 0 || updated > 0 || failures > 0) {
+        squire_logf("INFO",
+                    "MODULE_RECONCILE_COMPLETE directory=%s candidates=%u hotloaded=%u updated=%u failures=%u",
+                    directory,
+                    candidates,
+                    hotloaded,
+                    updated,
+                    failures);
+    }
 
     return failures == 0 ? 0 : -1;
 }
