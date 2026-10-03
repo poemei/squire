@@ -1,3 +1,4 @@
 # Squire Core configuration
 log_path=/opt/squire/logs/squire.log
 log_level=INFO
+module_dir=/opt/squire/modules
