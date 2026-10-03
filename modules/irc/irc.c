@@ -2,12 +2,12 @@
  * [AI: GPT-5.6 Sol | 2026-10-03 | Human approval pending]
  * Squire IRC transport module.
  *
- * Core owns module lifecycle audit. IRC transport diagnostics are written
- * separately to /opt/squire/logs/irc.log. Conversation content is not logged.
+ * Core owns module lifecycle audit. IRC transport diagnostics and inbound
+ * PRIVMSG traffic are written separately to /opt/squire/logs/irc.log.
+ * Credentials and SASL payloads are never logged.
  */
 #include "module.h"
 
-#include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
 #include <openssl/evp.h>
@@ -24,7 +24,7 @@
 
 #define SQUIRE_IRC_VERSION_MAJOR 0
 #define SQUIRE_IRC_VERSION_MINOR 2
-#define SQUIRE_IRC_VERSION_PATCH 2
+#define SQUIRE_IRC_VERSION_PATCH 3
 
 #define IRC_CONFIG_PATH "/opt/squire/config/irc.conf"
 #define IRC_LOG_PATH "/opt/squire/logs/irc.log"
@@ -74,7 +74,6 @@ static void irc_log(const char *format, ...)
     }
 
     pthread_mutex_lock(&irc_log_lock);
-
     file = fopen(IRC_LOG_PATH, "a");
     if (file != NULL) {
         fprintf(file, "%s ", timestamp);
@@ -84,15 +83,12 @@ static void irc_log(const char *format, ...)
         fputc('\n', file);
         fclose(file);
     }
-
     pthread_mutex_unlock(&irc_log_lock);
 }
 
-static void irc_test(int condition,
-                     stnlabz_module_qualification_result_t *result)
+static void irc_test(int condition, stnlabz_module_qualification_result_t *result)
 {
     result->tests_executed++;
-
     if (condition) {
         result->tests_passed++;
     } else {
@@ -162,19 +158,15 @@ static int irc_parse_uint(const char *text,
 
 static int irc_config_valid(const irc_config *config)
 {
-    if (config == NULL ||
-        config->server[0] == '\0' ||
-        config->port == 0 ||
-        config->channel[0] != '#' ||
-        config->nick[0] == '\0' ||
-        config->account[0] == '\0' ||
-        config->password[0] == '\0' ||
-        config->realname[0] == '\0' ||
-        config->reconnect_seconds == 0) {
-        return 0;
-    }
-
-    return 1;
+    return config != NULL &&
+           config->server[0] != '\0' &&
+           config->port != 0 &&
+           config->channel[0] == '#' &&
+           config->nick[0] != '\0' &&
+           config->account[0] != '\0' &&
+           config->password[0] != '\0' &&
+           config->realname[0] != '\0' &&
+           config->reconnect_seconds != 0;
 }
 
 static int irc_load_config(const char *path, irc_config *config)
@@ -387,9 +379,7 @@ static int irc_build_sasl_plain(const irc_config *config,
     raw[0] = '\0';
     memcpy(raw + 1, config->account, account_length);
     raw[1 + account_length] = '\0';
-    memcpy(raw + 1 + account_length + 1,
-           config->password,
-           password_length);
+    memcpy(raw + 1 + account_length + 1, config->password, password_length);
 
     if (((raw_length + 2) / 3) * 4 + 1 > encoded_size) {
         return -1;
@@ -402,6 +392,11 @@ static int irc_build_sasl_plain(const irc_config *config,
 
     encoded[encoded_length] = '\0';
     return 0;
+}
+
+static int irc_line_is_privmsg(const char *line)
+{
+    return line != NULL && strstr(line, " PRIVMSG ") != NULL;
 }
 
 static int irc_handle_session(SSL *ssl, const irc_config *config)
@@ -465,6 +460,10 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
 
             line_buffer[line_used] = '\0';
 
+            if (irc_line_is_privmsg(line_buffer)) {
+                irc_log("PRIVMSG %s", line_buffer);
+            }
+
             if (strncmp(line_buffer, "PING ", 5) == 0) {
                 char pong[IRC_LINE_MAX];
                 int length = snprintf(pong, sizeof(pong), "PONG %s\r\n", line_buffer + 5);
@@ -503,10 +502,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                     return -1;
                 }
 
-                length = snprintf(authenticate,
-                                  sizeof(authenticate),
-                                  "AUTHENTICATE %s\r\n",
-                                  encoded);
+                length = snprintf(authenticate, sizeof(authenticate), "AUTHENTICATE %s\r\n", encoded);
                 if (length < 0 || length >= (int)sizeof(authenticate) ||
                     irc_ssl_send(ssl, authenticate) != 0) {
                     irc_log("SASL_PAYLOAD_SEND_FAIL");
@@ -659,7 +655,6 @@ static void *irc_worker(void *context)
 
     while (!irc_stop_requested) {
         (void)irc_connect_once(config);
-
         if (!irc_stop_requested) {
             irc_sleep_reconnect(config->reconnect_seconds);
         }
@@ -699,13 +694,14 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
     irc_test(strcmp("irc", "irc") == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MAJOR == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MINOR == 2, result);
-    irc_test(SQUIRE_IRC_VERSION_PATCH == 2, result);
+    irc_test(SQUIRE_IRC_VERSION_PATCH == 3, result);
     irc_test(irc_parse_uint("6697", 1, 65535, &parsed) == 0 && parsed == 6697, result);
     irc_test(irc_parse_uint("0", 1, 65535, &parsed) != 0, result);
     irc_test(irc_copy_text(probe.nick, sizeof(probe.nick), "Squire") == 0, result);
     irc_test(irc_config_valid(&probe), result);
     irc_test(irc_build_sasl_plain(&probe, encoded, sizeof(encoded)) == 0 && encoded[0] != '\0', result);
     irc_test(!irc_started && irc_socket_fd == -1, result);
+    irc_test(irc_line_is_privmsg(":nick!user@host PRIVMSG ##rosaic :test"), result);
 
     result->negative_test_executed = 1;
     result->negative_test_passed = (irc_negative_probe(NULL) != 0);
@@ -732,7 +728,7 @@ static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
         return STNLABZ_MODULE_ERR_START_FAILED;
     }
 
-    irc_log("START version=0.2.2 config=%s", IRC_CONFIG_PATH);
+    irc_log("START version=0.2.3 config=%s", IRC_CONFIG_PATH);
 
     irc_stop_requested = 0;
     irc_set_current_socket(-1);
