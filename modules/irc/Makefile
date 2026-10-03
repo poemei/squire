@@ -29,11 +29,15 @@ $(TARGET): $(SOURCE) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -o $@ $(LDLIBS)
 
 install: $(TARGET)
-	install -d $(INSTALL_DIR) $(CONFIG_DIR)
-	@if [ ! -f $(CONFIG_TARGET) ]; then \
+	mkdir -p $(INSTALL_DIR)
+	mkdir -p $(CONFIG_DIR)
+	@if [ ! -e $(CONFIG_TARGET) ]; then \
 		install -m 0640 $(CONFIG_EXAMPLE) $(CONFIG_TARGET); \
-		echo "Created $(CONFIG_TARGET). Set the Libera account password, then rerun make install."; \
+		echo "Created $(CONFIG_TARGET). This file will never be overwritten by module install/update."; \
+		echo "Set the Libera account password, then rerun make install."; \
 		exit 1; \
+	else \
+		echo "Preserving existing $(CONFIG_TARGET) unchanged"; \
 	fi
 	@if ! grep -Eq '^password=.+$$' $(CONFIG_TARGET); then \
 		echo "Refusing to expose $(MODULE).so: $(CONFIG_TARGET) has no Libera account password."; \
