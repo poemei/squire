@@ -1,221 +1,210 @@
 /*
  * [AI: GPT-5.6 Sol | 2026-10-03 | Human approval pending]
- * Squire Core generic module discovery, qualification, load, and unload.
+ * Squire Core module orchestration using the shared STN-LABZ ABI.
  */
 #include "squire.h"
-#include "module.h"
+#include "abi.h"
+#include "module_loader.h"
 
-#include <ctype.h>
 #include <dirent.h>
-#include <dlfcn.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
-#define SQUIRE_MAX_MODULES 64u
+static stnlabz_module_loader_t squire_loader;
+static stnlabz_module_registry_t squire_registry;
+static int squire_modules_initialized = 0;
 
-typedef struct loaded_module {
-    void *handle;
-    char path[SQUIRE_PATH_MAX];
-    char name[128];
-    char version[128];
-    squire_module_shutdown_fn shutdown;
-} loaded_module;
-
-static loaded_module squire_modules[SQUIRE_MAX_MODULES];
-static size_t squire_module_count = 0;
-
-static int squire_module_name_valid(const char *name)
+static int squire_host_send_message(const char *message)
 {
-    size_t i;
+    (void)message;
+    return -1;
+}
 
-    if (name == NULL || name[0] == '\0') {
+static int squire_host_register_command(const char *name,
+                                        stnlabz_module_command_handler_fn handler,
+                                        void *handler_context)
+{
+    (void)name;
+    (void)handler;
+    (void)handler_context;
+    return -1;
+}
+
+static int squire_host_unregister_command(const char *name, void *handler_context)
+{
+    (void)name;
+    (void)handler_context;
+    return -1;
+}
+
+static int squire_host_register_service(const char *name,
+                                        stnlabz_module_service_handler_fn handler,
+                                        void *handler_context)
+{
+    (void)name;
+    (void)handler;
+    (void)handler_context;
+    return -1;
+}
+
+static int squire_host_unregister_service(const char *name, void *handler_context)
+{
+    (void)name;
+    (void)handler_context;
+    return -1;
+}
+
+static stnlabz_module_result_t squire_host_invoke_service(const char *name,
+                                                           const void *request,
+                                                           size_t request_size,
+                                                           void *response,
+                                                           size_t response_size,
+                                                           size_t *response_used)
+{
+    (void)name;
+    (void)request;
+    (void)request_size;
+    (void)response;
+    (void)response_size;
+    if (response_used != NULL) {
+        *response_used = 0;
+    }
+    return STNLABZ_MODULE_ERR_NOT_FOUND;
+}
+
+static const stnlabz_module_host_t SQUIRE_MODULE_HOST = {
+    squire_host_send_message,
+    squire_host_register_command,
+    squire_host_unregister_command,
+    squire_host_register_service,
+    squire_host_unregister_service,
+    squire_host_invoke_service
+};
+
+static void squire_module_version(const stnlabz_module_descriptor_t *descriptor,
+                                  char *buffer,
+                                  size_t size)
+{
+    if (buffer == NULL || size == 0) {
+        return;
+    }
+
+    if (descriptor == NULL) {
+        snprintf(buffer, size, "%s", "unknown");
+        return;
+    }
+
+    snprintf(buffer,
+             size,
+             "%u.%u.%u",
+             descriptor->version_major,
+             descriptor->version_minor,
+             descriptor->version_patch);
+}
+
+static int squire_module_candidate(const char *filename, char *module_id, size_t module_id_size)
+{
+    size_t length;
+    size_t id_length;
+
+    if (filename == NULL || module_id == NULL || module_id_size == 0) {
         return 0;
     }
 
-    if (!islower((unsigned char)name[0])) {
+    length = strlen(filename);
+    if (length <= 3 || strcmp(filename + length - 3, ".so") != 0) {
         return 0;
     }
 
-    for (i = 0; name[i] != '\0'; i++) {
-        unsigned char ch = (unsigned char)name[i];
-        if (!(islower(ch) || isdigit(ch) || ch == '_' || ch == '-')) {
-            return 0;
-        }
+    id_length = length - 3;
+    if (id_length == 0 || id_length >= module_id_size || id_length >= STNLABZ_MODULE_ID_MAX) {
+        return 0;
     }
 
+    memcpy(module_id, filename, id_length);
+    module_id[id_length] = '\0';
     return 1;
 }
 
-static int squire_module_file_candidate(const char *name)
+static int squire_module_load_one(const char *module_id, const char *path)
 {
-    size_t length;
-
-    if (name == NULL) {
-        return 0;
-    }
-
-    length = strlen(name);
-    return length > 3 && strcmp(name + length - 3, ".so") == 0;
-}
-
-static int squire_module_already_loaded(const char *name)
-{
-    size_t i;
-
-    for (i = 0; i < squire_module_count; i++) {
-        if (strcmp(squire_modules[i].name, name) == 0) {
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-static int squire_module_load_one(const char *path)
-{
-    struct stat st;
-    void *handle;
-    squire_module_manifest_get_fn manifest_get;
-    squire_module_qualify_fn qualify;
-    squire_module_init_fn init;
-    squire_module_shutdown_fn shutdown;
-    const squire_module_manifest *manifest;
-    squire_module_qualification qualification;
-    squire_module_host host;
-    const char *error_text;
+    const stnlabz_module_descriptor_t *descriptor = NULL;
+    const stnlabz_module_record_t *record;
+    stnlabz_module_loader_result_t loader_result;
+    stnlabz_module_result_t lifecycle_result;
+    char version[64];
     char detail[512];
 
-    if (path == NULL || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
-        squire_audit_event("MODULE_REJECTED", "FAILURE", path != NULL ? path : "unknown", "unknown",
-                           "module path is not a regular file");
+    squire_audit_event("MODULE_DISCOVERED", "SUCCESS", module_id, "unknown", path);
+    squire_audit_event("MODULE_LOAD_BEGIN", "BEGIN", module_id, "unknown", path);
+
+    loader_result = stnlabz_module_loader_load(&squire_loader, module_id, path, &descriptor);
+    if (loader_result != STNLABZ_MODULE_LOADER_OK) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "ABI loader rejected module: %s",
+                 stnlabz_module_loader_result_string(loader_result));
+        squire_audit_event("MODULE_LOAD_FAIL", "FAILURE", module_id, "unknown", detail);
         return -1;
     }
 
-    squire_audit_event("MODULE_DISCOVERED", "SUCCESS", path, "unknown", "candidate shared object discovered");
+    squire_module_version(descriptor, version, sizeof(version));
 
-    dlerror();
-    handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (handle == NULL) {
-        error_text = dlerror();
-        squire_audit_event("MODULE_LOAD_FAIL", "FAILURE", path, "unknown",
-                           error_text != NULL ? error_text : "dlopen failed");
+    if (descriptor->start == NULL || descriptor->stop == NULL) {
+        squire_audit_event("MODULE_REJECTED", "FAILURE", descriptor->id, version,
+                           "module start and stop callbacks are required by Squire Core");
+        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
         return -1;
     }
 
-    *(void **)(&manifest_get) = dlsym(handle, "squire_module_manifest_get");
-    *(void **)(&qualify) = dlsym(handle, "squire_module_qualify");
-    *(void **)(&init) = dlsym(handle, "squire_module_init");
-    *(void **)(&shutdown) = dlsym(handle, "squire_module_shutdown");
+    squire_audit_event("MODULE_QUALIFICATION_BEGIN", "BEGIN", descriptor->id, version,
+                       "STN-LABZ ABI verification and qualification starting");
 
-    if (manifest_get == NULL || qualify == NULL || init == NULL || shutdown == NULL) {
-        squire_audit_event("MODULE_REJECTED", "FAILURE", path, "unknown",
-                           "required module ABI symbol missing");
-        dlclose(handle);
+    lifecycle_result = stnlabz_module_abi_prepare(&squire_registry, descriptor);
+    if (lifecycle_result != STNLABZ_MODULE_OK) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "ABI qualification failed: %s",
+                 stnlabz_module_result_string(lifecycle_result));
+        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", descriptor->id, version, detail);
+        (void)stnlabz_module_abi_unregister(&squire_registry, descriptor->id);
+        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
         return -1;
     }
 
-    manifest = manifest_get();
-    if (manifest == NULL) {
-        squire_audit_event("MODULE_REJECTED", "FAILURE", path, "unknown", "manifest is null");
-        dlclose(handle);
+    record = stnlabz_module_registry_find(&squire_registry, descriptor->id);
+    if (record == NULL) {
+        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", descriptor->id, version,
+                           "qualified module missing from ABI registry");
+        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
         return -1;
     }
 
-    if (manifest->abi_version != SQUIRE_MODULE_ABI_VERSION) {
-        squire_audit_event("MODULE_REJECTED", "FAILURE",
-                           manifest->name != NULL ? manifest->name : path,
-                           manifest->version != NULL ? manifest->version : "unknown",
-                           "module ABI version mismatch");
-        dlclose(handle);
+    snprintf(detail,
+             sizeof(detail),
+             "tests_executed=%u tests_passed=%u tests_failed=%u negative_test=%s",
+             record->qualification.tests_executed,
+             record->qualification.tests_passed,
+             record->qualification.tests_failed,
+             record->qualification.negative_test_passed ? "PASS" : "FAIL");
+    squire_audit_event("MODULE_QUALIFICATION_PASS", "SUCCESS", descriptor->id, version, detail);
+
+    lifecycle_result = stnlabz_module_abi_authorize_and_activate(&squire_registry,
+                                                                  descriptor->id,
+                                                                  &SQUIRE_MODULE_HOST);
+    if (lifecycle_result != STNLABZ_MODULE_OK) {
+        snprintf(detail,
+                 sizeof(detail),
+                 "ABI activation failed: %s",
+                 stnlabz_module_result_string(lifecycle_result));
+        squire_audit_event("MODULE_LOAD_FAIL", "FAILURE", descriptor->id, version, detail);
+        (void)stnlabz_module_abi_unregister(&squire_registry, descriptor->id);
+        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
         return -1;
     }
 
-    if (!squire_module_name_valid(manifest->name)) {
-        squire_audit_event("MODULE_REJECTED", "FAILURE", path,
-                           manifest->version != NULL ? manifest->version : "unknown",
-                           "invalid module name");
-        dlclose(handle);
-        return -1;
-    }
-
-    if (manifest->version == NULL || manifest->version[0] == '\0') {
-        squire_audit_event("MODULE_REJECTED", "FAILURE", manifest->name, "unknown",
-                           "module version is required");
-        dlclose(handle);
-        return -1;
-    }
-
-    if (squire_module_already_loaded(manifest->name)) {
-        squire_audit_event("MODULE_REJECTED", "FAILURE", manifest->name, manifest->version,
-                           "module with this name is already loaded");
-        dlclose(handle);
-        return -1;
-    }
-
-    if (squire_module_count >= SQUIRE_MAX_MODULES) {
-        squire_audit_event("MODULE_REJECTED", "FAILURE", manifest->name, manifest->version,
-                           "Core module capacity reached");
-        dlclose(handle);
-        return -1;
-    }
-
-    memset(&qualification, 0, sizeof(qualification));
-    squire_audit_event("MODULE_QUALIFICATION_BEGIN", "BEGIN", manifest->name, manifest->version,
-                       "Core ABI checks passed; internal qualification starting");
-
-    if (qualify(&qualification) != 0) {
-        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", manifest->name, manifest->version,
-                           qualification.detail != NULL ? qualification.detail : "qualification callback failed");
-        dlclose(handle);
-        return -1;
-    }
-
-    if (qualification.tests_run < SQUIRE_MODULE_MIN_INTERNAL_TESTS ||
-        qualification.tests_failed != 0 ||
-        qualification.tests_passed != qualification.tests_run) {
-        snprintf(detail, sizeof(detail),
-                 "tests_run=%u tests_passed=%u tests_failed=%u minimum=%u",
-                 qualification.tests_run,
-                 qualification.tests_passed,
-                 qualification.tests_failed,
-                 SQUIRE_MODULE_MIN_INTERNAL_TESTS);
-        squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", manifest->name, manifest->version, detail);
-        dlclose(handle);
-        return -1;
-    }
-
-    snprintf(detail, sizeof(detail),
-             "tests_run=%u tests_passed=%u tests_failed=%u",
-             qualification.tests_run,
-             qualification.tests_passed,
-             qualification.tests_failed);
-    squire_audit_event("MODULE_QUALIFICATION_PASS", "SUCCESS", manifest->name, manifest->version, detail);
-
-    host.log = squire_log;
-    host.audit = squire_audit_event;
-
-    squire_audit_event("MODULE_LOAD_BEGIN", "BEGIN", manifest->name, manifest->version, path);
-    if (init(&host) != 0) {
-        squire_audit_event("MODULE_LOAD_FAIL", "FAILURE", manifest->name, manifest->version,
-                           "module init returned failure");
-        dlclose(handle);
-        return -1;
-    }
-
-    squire_modules[squire_module_count].handle = handle;
-    squire_modules[squire_module_count].shutdown = shutdown;
-    snprintf(squire_modules[squire_module_count].path,
-             sizeof(squire_modules[squire_module_count].path), "%s", path);
-    snprintf(squire_modules[squire_module_count].name,
-             sizeof(squire_modules[squire_module_count].name), "%s", manifest->name);
-    snprintf(squire_modules[squire_module_count].version,
-             sizeof(squire_modules[squire_module_count].version), "%s", manifest->version);
-    squire_module_count++;
-
-    squire_audit_event("MODULE_LOAD_SUCCESS", "SUCCESS", manifest->name, manifest->version,
-                       "module qualified and activated");
+    squire_audit_event("MODULE_LOAD_SUCCESS", "SUCCESS", descriptor->id, version,
+                       "module qualified, authorized, and active");
     return 0;
 }
 
@@ -225,10 +214,17 @@ int squire_modules_load_directory(const char *directory)
     struct dirent *entry;
     unsigned int candidates = 0;
     unsigned int loaded = 0;
+    char module_id[STNLABZ_MODULE_ID_MAX];
     char path[SQUIRE_PATH_MAX];
 
     if (directory == NULL || directory[0] == '\0') {
         return -1;
+    }
+
+    if (!squire_modules_initialized) {
+        stnlabz_module_loader_init(&squire_loader);
+        stnlabz_module_registry_init(&squire_registry);
+        squire_modules_initialized = 1;
     }
 
     dir = opendir(directory);
@@ -239,18 +235,18 @@ int squire_modules_load_directory(const char *directory)
     }
 
     while ((entry = readdir(dir)) != NULL) {
-        if (!squire_module_file_candidate(entry->d_name)) {
+        if (!squire_module_candidate(entry->d_name, module_id, sizeof(module_id))) {
             continue;
         }
 
         candidates++;
         if (snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name) >= (int)sizeof(path)) {
-            squire_audit_event("MODULE_REJECTED", "FAILURE", entry->d_name, "unknown",
+            squire_audit_event("MODULE_REJECTED", "FAILURE", module_id, "unknown",
                                "module path exceeds Core path limit");
             continue;
         }
 
-        if (squire_module_load_one(path) == 0) {
+        if (squire_module_load_one(module_id, path) == 0) {
             loaded++;
         }
     }
@@ -263,23 +259,53 @@ int squire_modules_load_directory(const char *directory)
 
 void squire_modules_unload_all(void)
 {
-    while (squire_module_count > 0) {
-        loaded_module *module;
+    while (squire_loader.count > 0) {
+        const stnlabz_loaded_module_t *loaded;
+        const stnlabz_module_descriptor_t *descriptor;
+        stnlabz_module_result_t lifecycle_result;
+        stnlabz_module_loader_result_t loader_result;
+        char module_id[STNLABZ_MODULE_ID_MAX];
+        char version[64];
+        char detail[256];
 
-        squire_module_count--;
-        module = &squire_modules[squire_module_count];
-        squire_audit_event("MODULE_UNLOAD_BEGIN", "BEGIN", module->name, module->version,
-                           "Core shutdown");
+        loaded = &squire_loader.modules[squire_loader.count - 1];
+        descriptor = loaded->descriptor;
+        snprintf(module_id, sizeof(module_id), "%s", loaded->module_id);
+        squire_module_version(descriptor, version, sizeof(version));
 
-        module->shutdown();
-        if (dlclose(module->handle) != 0) {
-            squire_audit_event("MODULE_UNLOAD_FAIL", "FAILURE", module->name, module->version,
-                               "dlclose failed");
-        } else {
-            squire_audit_event("MODULE_UNLOAD_SUCCESS", "SUCCESS", module->name, module->version,
-                               "module deactivated");
+        squire_audit_event("MODULE_UNLOAD_BEGIN", "BEGIN", module_id, version, "Core shutdown");
+
+        lifecycle_result = stnlabz_module_abi_stop(&squire_registry, module_id);
+        if (lifecycle_result != STNLABZ_MODULE_OK) {
+            snprintf(detail,
+                     sizeof(detail),
+                     "ABI stop failed: %s",
+                     stnlabz_module_result_string(lifecycle_result));
+            squire_audit_event("MODULE_UNLOAD_FAIL", "FAILURE", module_id, version, detail);
+            break;
         }
 
-        memset(module, 0, sizeof(*module));
+        lifecycle_result = stnlabz_module_abi_unregister(&squire_registry, module_id);
+        if (lifecycle_result != STNLABZ_MODULE_OK) {
+            snprintf(detail,
+                     sizeof(detail),
+                     "ABI unregister failed: %s",
+                     stnlabz_module_result_string(lifecycle_result));
+            squire_audit_event("MODULE_UNLOAD_FAIL", "FAILURE", module_id, version, detail);
+            break;
+        }
+
+        loader_result = stnlabz_module_loader_unload(&squire_loader, module_id);
+        if (loader_result != STNLABZ_MODULE_LOADER_OK) {
+            snprintf(detail,
+                     sizeof(detail),
+                     "ABI loader unload failed: %s",
+                     stnlabz_module_loader_result_string(loader_result));
+            squire_audit_event("MODULE_UNLOAD_FAIL", "FAILURE", module_id, version, detail);
+            break;
+        }
+
+        squire_audit_event("MODULE_UNLOAD_SUCCESS", "SUCCESS", module_id, version,
+                           "module stopped, unregistered, and unloaded");
     }
 }
