@@ -28,5 +28,10 @@ int squire_log_open(const char *path);
 void squire_log_close(void);
 void squire_log(const char *level, const char *message);
 void squire_logf(const char *level, const char *format, ...);
+void squire_audit_event(const char *event,
+                        const char *status,
+                        const char *subject,
+                        const char *version,
+                        const char *detail);
 
 #endif
