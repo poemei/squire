@@ -12,7 +12,7 @@ ABI_OBJECTS := build/abi.o build/abi_module.o build/abi_registry.o build/abi_loa
 
 TEST_MODULE_DIR := build/modules/test_module
 TEST_MODULE := $(TEST_MODULE_DIR)/test_module.so
-TEST_MODULE_V2 := $(TEST_MODULE_DIR)/test_module_v2.so
+TEST_MODULE_V4 := $(TEST_MODULE_DIR)/test_module_v4.so
 TEST_MODULE_BAD := $(TEST_MODULE_DIR)/test_module_bad.so
 
 PREFIX ?= /opt/squire
@@ -25,8 +25,8 @@ STATEDIR := $(PREFIX)/state
 SYSTEMD_DIR ?= /etc/systemd/system
 SERVICE := squire.service
 
-.PHONY: all clean install uninstall test-module test-module-v2 test-module-bad \
-	install-test-module install-test-module-v2 install-test-module-bad uninstall-test-module
+.PHONY: all clean install uninstall test-module test-module-v4 test-module-bad \
+	install-test-module install-test-module-v4 install-test-module-bad uninstall-test-module
 
 all: $(TARGET)
 
@@ -56,10 +56,10 @@ $(TEST_MODULE): tests/modules/test_module.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared \
 		-DTEST_MODULE_VERSION_MINOR=1 $< -o $@
 
-$(TEST_MODULE_V2): tests/modules/test_module.c
+$(TEST_MODULE_V4): tests/modules/test_module.c
 	mkdir -p $(TEST_MODULE_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared \
-		-DTEST_MODULE_VERSION_MINOR=2 $< -o $@
+		-DTEST_MODULE_VERSION_MINOR=4 $< -o $@
 
 $(TEST_MODULE_BAD): tests/modules/test_module.c
 	mkdir -p $(TEST_MODULE_DIR)
@@ -70,8 +70,8 @@ $(TEST_MODULE_BAD): tests/modules/test_module.c
 test-module: $(TEST_MODULE)
 	@echo "Built $(TEST_MODULE)"
 
-test-module-v2: $(TEST_MODULE_V2)
-	@echo "Built $(TEST_MODULE_V2)"
+test-module-v4: $(TEST_MODULE_V4)
+	@echo "Built $(TEST_MODULE_V4)"
 
 test-module-bad: $(TEST_MODULE_BAD)
 	@echo "Built $(TEST_MODULE_BAD)"
@@ -81,10 +81,10 @@ install-test-module: $(TEST_MODULE)
 	install -m 0755 $(TEST_MODULE) $(MODULEDIR)/test_module/test_module.so
 	@echo "Installed test module v0.1.0 to $(MODULEDIR)/test_module/test_module.so"
 
-install-test-module-v2: $(TEST_MODULE_V2)
+install-test-module-v4: $(TEST_MODULE_V4)
 	install -d $(MODULEDIR)/test_module
-	install -m 0755 $(TEST_MODULE_V2) $(MODULEDIR)/test_module/test_module.so
-	@echo "Installed test module v0.2.0 to $(MODULEDIR)/test_module/test_module.so"
+	install -m 0755 $(TEST_MODULE_V4) $(MODULEDIR)/test_module/test_module.so
+	@echo "Installed test module v0.4.0 to $(MODULEDIR)/test_module/test_module.so"
 
 install-test-module-bad: $(TEST_MODULE_BAD)
 	install -d $(MODULEDIR)/test_module
