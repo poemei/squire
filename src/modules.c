@@ -126,6 +126,27 @@ static int squire_module_candidate(const char *filename, char *module_id, size_t
     return 1;
 }
 
+static void squire_module_cleanup_failed(const char *module_id)
+{
+    const stnlabz_module_record_t *record;
+
+    if (module_id == NULL || module_id[0] == '\0') {
+        return;
+    }
+
+    record = stnlabz_module_registry_find(&squire_registry, module_id);
+    if (record != NULL) {
+        if (record->state != STNLABZ_MODULE_STATE_FAILED &&
+            record->state != STNLABZ_MODULE_STATE_QUARANTINED &&
+            record->state != STNLABZ_MODULE_STATE_STOPPED) {
+            (void)stnlabz_module_registry_fail(&squire_registry, module_id);
+        }
+        (void)stnlabz_module_abi_unregister(&squire_registry, module_id);
+    }
+
+    (void)stnlabz_module_loader_unload(&squire_loader, module_id);
+}
+
 static int squire_module_load_one(const char *module_id, const char *path)
 {
     const stnlabz_module_descriptor_t *descriptor = NULL;
@@ -153,7 +174,7 @@ static int squire_module_load_one(const char *module_id, const char *path)
     if (descriptor->start == NULL || descriptor->stop == NULL) {
         squire_audit_event("MODULE_REJECTED", "FAILURE", descriptor->id, version,
                            "module start and stop callbacks are required by Squire Core");
-        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
+        squire_module_cleanup_failed(descriptor->id);
         return -1;
     }
 
@@ -167,8 +188,7 @@ static int squire_module_load_one(const char *module_id, const char *path)
                  "ABI qualification failed: %s",
                  stnlabz_module_result_string(lifecycle_result));
         squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", descriptor->id, version, detail);
-        (void)stnlabz_module_abi_unregister(&squire_registry, descriptor->id);
-        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
+        squire_module_cleanup_failed(descriptor->id);
         return -1;
     }
 
@@ -176,7 +196,7 @@ static int squire_module_load_one(const char *module_id, const char *path)
     if (record == NULL) {
         squire_audit_event("MODULE_QUALIFICATION_FAIL", "FAILURE", descriptor->id, version,
                            "qualified module missing from ABI registry");
-        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
+        squire_module_cleanup_failed(descriptor->id);
         return -1;
     }
 
@@ -198,8 +218,7 @@ static int squire_module_load_one(const char *module_id, const char *path)
                  "ABI activation failed: %s",
                  stnlabz_module_result_string(lifecycle_result));
         squire_audit_event("MODULE_LOAD_FAIL", "FAILURE", descriptor->id, version, detail);
-        (void)stnlabz_module_abi_unregister(&squire_registry, descriptor->id);
-        (void)stnlabz_module_loader_unload(&squire_loader, descriptor->id);
+        squire_module_cleanup_failed(descriptor->id);
         return -1;
     }
 
