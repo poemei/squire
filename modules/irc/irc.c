@@ -23,7 +23,7 @@
 
 #define SQUIRE_IRC_VERSION_MAJOR 0
 #define SQUIRE_IRC_VERSION_MINOR 2
-#define SQUIRE_IRC_VERSION_PATCH 0
+#define SQUIRE_IRC_VERSION_PATCH 1
 
 #define IRC_CONFIG_PATH "/opt/squire/config/irc.conf"
 #define IRC_TEXT_MAX 256
@@ -331,17 +331,16 @@ static int irc_build_sasl_plain(const irc_config *config,
 
     account_length = strlen(config->account);
     password_length = strlen(config->password);
-    raw_length = account_length + 1 + account_length + 1 + password_length;
+    raw_length = 1 + account_length + 1 + password_length;
 
     if (raw_length > sizeof(raw)) {
         return -1;
     }
 
-    memcpy(raw, config->account, account_length);
-    raw[account_length] = '\0';
-    memcpy(raw + account_length + 1, config->account, account_length);
-    raw[account_length + 1 + account_length] = '\0';
-    memcpy(raw + account_length + 1 + account_length + 1,
+    raw[0] = '\0';
+    memcpy(raw + 1, config->account, account_length);
+    raw[1 + account_length] = '\0';
+    memcpy(raw + 1 + account_length + 1,
            config->password,
            password_length);
 
@@ -601,7 +600,7 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
     irc_test(strcmp("irc", "irc") == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MAJOR == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MINOR == 2, result);
-    irc_test(SQUIRE_IRC_VERSION_PATCH == 0, result);
+    irc_test(SQUIRE_IRC_VERSION_PATCH == 1, result);
     irc_test(irc_parse_uint("6697", 1, 65535, &parsed) == 0 && parsed == 6697, result);
     irc_test(irc_parse_uint("0", 1, 65535, &parsed) != 0, result);
     irc_test(irc_copy_text(probe.nick, sizeof(probe.nick), "Squire") == 0, result);
