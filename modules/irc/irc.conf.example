@@ -1,0 +1,10 @@
+# [AI: GPT-5.6 Sol | 2026-10-03 | Human approval pending]
+# Squire IRC module configuration
+server=irc.libera.chat
+port=6697
+channel=##rosaic
+nick=Squire
+account=Squire
+password=
+realname=Squire Rosaic Information Agent
+reconnect_seconds=10
