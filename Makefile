@@ -9,7 +9,8 @@ TARGET := build/squire
 SOURCES := src/main.c src/log.c src/config.c src/modules.c
 OBJECTS := $(SOURCES:src/%.c=build/%.o)
 ABI_OBJECTS := build/abi.o build/abi_module.o build/abi_registry.o build/abi_loader_linux.o
-TEST_MODULE := build/test_module.so
+TEST_MODULE_DIR := build/modules/test_module
+TEST_MODULE := $(TEST_MODULE_DIR)/test_module.so
 
 PREFIX ?= /opt/squire
 BINDIR := $(PREFIX)/bin
@@ -46,20 +47,21 @@ build/abi_loader_linux.o: $(ABI_DIR)/src/loader_linux.c | build
 $(TARGET): $(OBJECTS) $(ABI_OBJECTS)
 	$(CC) $(OBJECTS) $(ABI_OBJECTS) $(LDFLAGS) -o $@
 
-$(TEST_MODULE): tests/modules/test_module.c | build
+$(TEST_MODULE): tests/modules/test_module.c
+	mkdir -p $(TEST_MODULE_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fPIC -shared $< -o $@
 
 test-module: $(TEST_MODULE)
 	@echo "Built $(TEST_MODULE)"
 
 install-test-module: $(TEST_MODULE)
-	install -d $(MODULEDIR)
-	install -m 0755 $(TEST_MODULE) $(MODULEDIR)/test_module.so
-	@echo "Installed test module to $(MODULEDIR)/test_module.so"
+	install -d $(MODULEDIR)/test_module
+	install -m 0755 $(TEST_MODULE) $(MODULEDIR)/test_module/test_module.so
+	@echo "Installed test module to $(MODULEDIR)/test_module/test_module.so"
 
 uninstall-test-module:
-	rm -f $(MODULEDIR)/test_module.so
-	@echo "Removed test module from $(MODULEDIR)/test_module.so"
+	rm -rf $(MODULEDIR)/test_module
+	@echo "Removed test module directory $(MODULEDIR)/test_module"
 
 install: $(TARGET)
 	install -d $(BINDIR) $(CONFIGDIR) $(LOGDIR) $(MODULEDIR) $(RAGDIR) $(STATEDIR)
