@@ -4,23 +4,19 @@
  */
 #include "squire.h"
 
+#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t squire_running = 1;
 static volatile sig_atomic_t squire_stop_signal = 0;
-static volatile sig_atomic_t squire_reload_requested = 0;
 
 static void squire_signal_handler(int signal_number)
 {
-    if (signal_number == SIGHUP) {
-        squire_reload_requested = 1;
-        return;
-    }
-
     squire_stop_signal = signal_number;
     squire_running = 0;
 }
@@ -41,24 +37,34 @@ static int squire_install_signal_handlers(void)
         return -1;
     }
 
-    if (sigaction(SIGHUP, &action, NULL) != 0) {
-        return -1;
-    }
-
     return 0;
 }
 
 static const char *squire_signal_name(int signal_number)
 {
     switch (signal_number) {
-        case SIGHUP:
-            return "SIGHUP";
         case SIGINT:
             return "SIGINT";
         case SIGTERM:
             return "SIGTERM";
         default:
             return "UNKNOWN";
+    }
+}
+
+static void squire_hotload_interval(void)
+{
+    struct timespec requested;
+    struct timespec remaining;
+
+    requested.tv_sec = 1;
+    requested.tv_nsec = 0;
+
+    while (squire_running && nanosleep(&requested, &remaining) != 0) {
+        if (errno != EINTR) {
+            break;
+        }
+        requested = remaining;
     }
 }
 
@@ -114,23 +120,17 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    squire_log("INFO", "MODULE_HOTLOAD_MONITOR active interval_seconds=1");
+
     while (squire_running) {
-        pause();
+        squire_hotload_interval();
 
-        if (squire_running && squire_reload_requested) {
-            squire_reload_requested = 0;
-            squire_log("INFO", "MODULE_RECONCILE_REQUEST signal=SIGHUP");
-            squire_audit_event("MODULE_RECONCILE_BEGIN", "BEGIN", "core", SQUIRE_VERSION,
-                               "SIGHUP");
+        if (!squire_running) {
+            break;
+        }
 
-            if (squire_modules_reconcile_directory(config.module_dir) != 0) {
-                squire_log("ERROR", "MODULE_RECONCILE_FAILED");
-                squire_audit_event("MODULE_RECONCILE_FAIL", "FAILURE", "core", SQUIRE_VERSION,
-                                   "one or more module operations failed");
-            } else {
-                squire_audit_event("MODULE_RECONCILE_SUCCESS", "SUCCESS", "core", SQUIRE_VERSION,
-                                   "module directory reconciled");
-            }
+        if (squire_modules_reconcile_directory(config.module_dir) != 0) {
+            squire_log("ERROR", "MODULE_RECONCILE_FAILED");
         }
     }
 
