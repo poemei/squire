@@ -21,6 +21,35 @@ static void squire_timestamp(char *buffer, size_t size)
     strftime(buffer, size, "%Y-%m-%dT%H:%M:%S%z", &tm_now);
 }
 
+static void squire_sanitize_field(const char *input, char *output, size_t size)
+{
+    size_t i;
+    size_t j;
+
+    if (output == NULL || size == 0) {
+        return;
+    }
+
+    output[0] = '\0';
+    if (input == NULL) {
+        return;
+    }
+
+    for (i = 0, j = 0; input[i] != '\0' && j + 1 < size; i++) {
+        char ch = input[i];
+
+        if (ch == '\n' || ch == '\r' || ch == '\t') {
+            ch = ' ';
+        } else if (ch == '"') {
+            ch = '\'';
+        }
+
+        output[j++] = ch;
+    }
+
+    output[j] = '\0';
+}
+
 int squire_log_open(const char *path)
 {
     if (path == NULL || path[0] == '\0') {
@@ -70,4 +99,35 @@ void squire_logf(const char *level, const char *format, ...)
     va_end(args);
 
     squire_log(level, message);
+}
+
+void squire_audit_event(const char *event,
+                        const char *status,
+                        const char *subject,
+                        const char *version,
+                        const char *detail)
+{
+    char clean_event[128];
+    char clean_status[64];
+    char clean_subject[256];
+    char clean_version[128];
+    char clean_detail[1024];
+    char message[2048];
+
+    squire_sanitize_field(event, clean_event, sizeof(clean_event));
+    squire_sanitize_field(status, clean_status, sizeof(clean_status));
+    squire_sanitize_field(subject, clean_subject, sizeof(clean_subject));
+    squire_sanitize_field(version, clean_version, sizeof(clean_version));
+    squire_sanitize_field(detail, clean_detail, sizeof(clean_detail));
+
+    snprintf(message,
+             sizeof(message),
+             "event=\"%s\" status=\"%s\" subject=\"%s\" version=\"%s\" detail=\"%s\"",
+             clean_event,
+             clean_status,
+             clean_subject,
+             clean_version,
+             clean_detail);
+
+    squire_log("AUDIT", message);
 }
