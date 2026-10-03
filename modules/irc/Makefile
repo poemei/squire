@@ -41,7 +41,7 @@ install: $(TARGET)
 	fi
 	install -m 0755 $(TARGET) $(INSTALL_TEMP)
 	mv -f $(INSTALL_TEMP) $(INSTALL_TARGET)
-	@echo "Installed $(MODULE) 0.2.0 to $(INSTALL_TARGET)"
+	@echo "Installed $(MODULE) 0.2.1 to $(INSTALL_TARGET)"
 
 uninstall:
 	rm -f $(INSTALL_TEMP) $(INSTALL_TARGET)
