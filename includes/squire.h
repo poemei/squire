@@ -13,6 +13,7 @@
 #define SQUIRE_DEFAULT_CONFIG "/opt/squire/config/squire.conf"
 #define SQUIRE_DEFAULT_LOG "/opt/squire/logs/squire.log"
 #define SQUIRE_DEFAULT_MODULE_DIR "/opt/squire/modules"
+#define SQUIRE_MODULE_STATE_DIR "/opt/squire/state/modules"
 
 #define SQUIRE_PATH_MAX 4096
 #define SQUIRE_VALUE_MAX 1024
@@ -37,6 +38,7 @@ void squire_audit_event(const char *event,
                         const char *detail);
 
 int squire_modules_load_directory(const char *directory);
+int squire_modules_reconcile_directory(const char *directory);
 void squire_modules_unload_all(void);
 
 #endif
