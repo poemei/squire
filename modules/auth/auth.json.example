@@ -10,6 +10,16 @@
       "account": "M_Rowan",
       "channel": "##rosaic",
       "permissions": ["op"]
+    },
+    {
+      "account": "chain-bot",
+      "channel": "##rosaic",
+      "permissions": ["deny"]
+    },
+    {
+      "account": "rictus",
+      "channel": "##rosaic",
+      "permissions": ["deny"]
     }
   ]
 }
