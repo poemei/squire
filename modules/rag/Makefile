@@ -18,7 +18,7 @@ RAG_DIR := $(PREFIX)/rag
 PUBLIC_DATA := $(RAG_DIR)/public.json
 PUBLIC_EXAMPLE := public.json.example
 
-.PHONY: all clean install uninstall
+.PHONY: all clean install update-public uninstall
 
 all: $(TARGET)
 
@@ -41,6 +41,16 @@ install: $(TARGET)
 	install -m 0755 $(TARGET) $(INSTALL_TEMP)
 	mv -f $(INSTALL_TEMP) $(INSTALL_TARGET)
 	@echo "Installed $(MODULE) 0.2.0 to $(INSTALL_TARGET)"
+
+update-public:
+	mkdir -p $(RAG_DIR)
+	@if [ -e $(PUBLIC_DATA) ]; then \
+		cp -f $(PUBLIC_DATA) $(PUBLIC_DATA).bak; \
+		echo "Backed up existing dataset to $(PUBLIC_DATA).bak"; \
+	fi
+	install -m 0640 $(PUBLIC_EXAMPLE) $(PUBLIC_DATA)
+	@echo "Updated $(PUBLIC_DATA) from $(PUBLIC_EXAMPLE) by explicit operator request."
+	@echo "No Squire restart or module reload is required; the next query reads the updated dataset."
 
 uninstall:
 	rm -f $(INSTALL_TEMP) $(INSTALL_TARGET)
