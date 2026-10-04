@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define SQUIRE_RAG_VERSION_MAJOR 0
 #define SQUIRE_RAG_VERSION_MINOR 2
