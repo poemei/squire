@@ -1,15 +1,15 @@
 {
   "version": 1,
-  "fallback": "I do not have an approved public answer for that yet. Try: help, about, website, or who are you.",
+  "fallback": "I do not have an approved public answer for that yet. Try: help, about, website, who are you, status, or source.",
   "entries": [
     {
       "id": "help",
-      "aliases": ["help", "!help", "commands", "!commands", "what can you do"],
-      "response": "Available public topics: help, about, website, and who are you."
+      "aliases": ["help", "!help", "commands", "!commands", "what can you do", "what do you know"],
+      "response": "Available public topics: help, about, website, who are you, status, and source."
     },
     {
       "id": "website",
-      "aliases": ["website", "!website", "site", "url", "what is the website", "official website"],
+      "aliases": ["website", "!website", "site", "url", "what is the website", "official website", "ars rosaic website", "rosaic website"],
       "response": "The official Ars Rosaic website is https://www.arsrosaic.org"
     },
     {
@@ -19,8 +19,23 @@
     },
     {
       "id": "identity",
-      "aliases": ["who are you", "who is squire", "what are you", "about squire"],
+      "aliases": ["who are you", "who is squire", "what are you", "about squire", "squire"],
       "response": "I am Squire, the public Ars Rosaic information agent. I provide answers from approved public Rosaic information sources."
+    },
+    {
+      "id": "greeting",
+      "aliases": ["hello", "hi", "hey", "hello squire", "hi squire", "hey squire"],
+      "response": "Hello. I am Squire, the public Ars Rosaic information agent. Ask me for help to see the public topics I currently know."
+    },
+    {
+      "id": "status",
+      "aliases": ["status", "!status", "are you online", "are you working", "are you alive"],
+      "response": "Squire is online and answering from the currently loaded approved public information dataset."
+    },
+    {
+      "id": "source",
+      "aliases": ["source", "sources", "authority", "where do your answers come from", "where do you get your answers", "what are your sources"],
+      "response": "My answers come only from approved public Ars Rosaic information loaded into my local information dataset. If an approved answer is not available, I will say so rather than invent one."
     }
   ]
 }
