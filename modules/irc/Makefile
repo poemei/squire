@@ -2,7 +2,8 @@
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2 -D_POSIX_C_SOURCE=200809L
 ABI_DIR ?= ../../../ABI
-CPPFLAGS ?= -I$(ABI_DIR)/includes
+SQUIRE_INCLUDE_DIR ?= ../../includes
+CPPFLAGS ?= -I$(ABI_DIR)/includes -I$(SQUIRE_INCLUDE_DIR)
 LDLIBS ?= -lssl -lcrypto -lpthread
 
 MODULE := irc
@@ -45,7 +46,7 @@ install: $(TARGET)
 	fi
 	install -m 0755 $(TARGET) $(INSTALL_TEMP)
 	mv -f $(INSTALL_TEMP) $(INSTALL_TARGET)
-	@echo "Installed $(MODULE) 0.3.0 to $(INSTALL_TARGET)"
+	@echo "Installed $(MODULE) 0.4.0 to $(INSTALL_TARGET)"
 
 uninstall:
 	rm -f $(INSTALL_TEMP) $(INSTALL_TARGET)
