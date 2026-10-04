@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "fallback": "I do not have an approved public answer for that yet. Try: help, about, website, or who are you.",
+  "entries": [
+    {
+      "id": "help",
+      "aliases": ["help", "!help", "commands", "!commands", "what can you do"],
+      "response": "Available public topics: help, about, website, and who are you."
+    },
+    {
+      "id": "website",
+      "aliases": ["website", "!website", "site", "url", "what is the website", "official website"],
+      "response": "The official Ars Rosaic website is https://www.arsrosaic.org"
+    },
+    {
+      "id": "about",
+      "aliases": ["about", "!about", "what is rosaic", "what is ars rosaic", "tell me about rosaic", "tell me about ars rosaic"],
+      "response": "Rosaic is a contemporary spiritual path rooted in inquiry, nature, personal sovereignty, reflection, creative practice, and the disciplined exploration of spiritual experience."
+    },
+    {
+      "id": "identity",
+      "aliases": ["who are you", "who is squire", "what are you", "about squire"],
+      "response": "I am Squire, the public Ars Rosaic information agent. I provide answers from approved public Rosaic information sources."
+    }
+  ]
+}
