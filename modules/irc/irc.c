@@ -5,8 +5,12 @@
  * Core owns module lifecycle audit. IRC transport diagnostics are written
  * separately to /opt/squire/logs/irc.log. Inbound PRIVMSG content is retained
  * for doctrine/RAG inspection. Credentials and SASL payloads are never logged.
+ *
+ * IRC remains transport-only. Addressed questions are routed through Core to
+ * the named rosaic.query service; this module contains no Rosaic doctrine.
  */
 #include "module.h"
+#include "rosaic_query.h"
 
 #include <errno.h>
 #include <netdb.h>
@@ -18,13 +22,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #define SQUIRE_IRC_VERSION_MAJOR 0
-#define SQUIRE_IRC_VERSION_MINOR 3
+#define SQUIRE_IRC_VERSION_MINOR 4
 #define SQUIRE_IRC_VERSION_PATCH 0
 
 #define IRC_CONFIG_PATH "/opt/squire/config/irc.conf"
@@ -60,6 +65,7 @@ static pthread_mutex_t irc_socket_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t irc_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static int irc_socket_fd = -1;
 static irc_config irc_runtime_config;
+static const stnlabz_module_host_t *irc_host = NULL;
 
 static void irc_log(const char *format, ...)
 {
@@ -477,6 +483,146 @@ static int irc_parse_privmsg(const char *line, irc_privmsg *message)
     return 0;
 }
 
+static int irc_message_for_squire(const irc_config *config,
+                                  const irc_privmsg *privmsg,
+                                  const char **question,
+                                  const char **reply_target)
+{
+    size_t nick_length;
+    const char *text;
+
+    if (config == NULL || privmsg == NULL || question == NULL || reply_target == NULL) {
+        return 0;
+    }
+
+    if (strcasecmp(privmsg->target, config->nick) == 0) {
+        *question = privmsg->message;
+        *reply_target = privmsg->sender;
+        return privmsg->message[0] != '\0';
+    }
+
+    if (strcmp(privmsg->target, config->channel) != 0) {
+        return 0;
+    }
+
+    nick_length = strlen(config->nick);
+    if (strncasecmp(privmsg->message, config->nick, nick_length) != 0) {
+        return 0;
+    }
+
+    text = privmsg->message + nick_length;
+    if (*text != '\0' && *text != ':' && *text != ',' && *text != ' ' && *text != '\t') {
+        return 0;
+    }
+
+    while (*text == ':' || *text == ',' || *text == ' ' || *text == '\t') {
+        text++;
+    }
+
+    if (*text == '\0') {
+        return 0;
+    }
+
+    *question = text;
+    *reply_target = privmsg->target;
+    return 1;
+}
+
+static void irc_sanitize_reply(char *text)
+{
+    char *cursor;
+
+    if (text == NULL) {
+        return;
+    }
+
+    for (cursor = text; *cursor != '\0'; cursor++) {
+        if (*cursor == '\r' || *cursor == '\n') {
+            *cursor = ' ';
+        }
+    }
+}
+
+static int irc_send_privmsg(SSL *ssl, const char *target, const char *message)
+{
+    char buffer[IRC_LINE_MAX];
+    int length;
+
+    if (ssl == NULL || target == NULL || message == NULL ||
+        target[0] == '\0' || message[0] == '\0') {
+        return -1;
+    }
+
+    length = snprintf(buffer, sizeof(buffer), "PRIVMSG %s :%s\r\n", target, message);
+    if (length < 0 || length >= (int)sizeof(buffer)) {
+        return -1;
+    }
+
+    return irc_ssl_send(ssl, buffer);
+}
+
+static int irc_route_query(SSL *ssl,
+                           const irc_config *config,
+                           const irc_privmsg *privmsg)
+{
+    squire_rosaic_query_request request;
+    squire_rosaic_query_response response;
+    const char *question = NULL;
+    const char *reply_target = NULL;
+    size_t response_used = 0;
+    stnlabz_module_result_t result;
+
+    if (!irc_message_for_squire(config, privmsg, &question, &reply_target)) {
+        return 0;
+    }
+
+    if (irc_host == NULL || irc_host->invoke_service == NULL) {
+        irc_log("QUERY_ROUTE_FAIL reason=host_service_unavailable sender=%s", privmsg->sender);
+        return -1;
+    }
+
+    memset(&request, 0, sizeof(request));
+    memset(&response, 0, sizeof(response));
+
+    if (snprintf(request.sender, sizeof(request.sender), "%s", privmsg->sender) >=
+            (int)sizeof(request.sender) ||
+        snprintf(request.target, sizeof(request.target), "%s", privmsg->target) >=
+            (int)sizeof(request.target) ||
+        snprintf(request.question, sizeof(request.question), "%s", question) >=
+            (int)sizeof(request.question)) {
+        irc_log("QUERY_ROUTE_FAIL reason=request_too_long sender=%s", privmsg->sender);
+        return -1;
+    }
+
+    result = irc_host->invoke_service(SQUIRE_ROSAIC_QUERY_SERVICE,
+                                      &request,
+                                      sizeof(request),
+                                      &response,
+                                      sizeof(response),
+                                      &response_used);
+    if (result != STNLABZ_MODULE_OK ||
+        response_used != sizeof(response) ||
+        response.text[0] == '\0') {
+        irc_log("QUERY_ROUTE_FAIL service=%s result=%d sender=%s",
+                SQUIRE_ROSAIC_QUERY_SERVICE,
+                (int)result,
+                privmsg->sender);
+        return -1;
+    }
+
+    irc_sanitize_reply(response.text);
+    if (irc_send_privmsg(ssl, reply_target, response.text) != 0) {
+        irc_log("QUERY_REPLY_FAIL target=%s sender=%s", reply_target, privmsg->sender);
+        return -1;
+    }
+
+    irc_log("QUERY_REPLY_SENT target=%s requester=%s service=%s",
+            reply_target,
+            privmsg->sender,
+            SQUIRE_ROSAIC_QUERY_SERVICE);
+    return 1;
+}
+
 static int irc_sasl_failure_numeric(const char *line)
 {
     if (line == NULL) return 0;
@@ -555,6 +701,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                             privmsg.sender,
                             privmsg.target,
                             privmsg.message);
+                    (void)irc_route_query(ssl, config, &privmsg);
                 }
             }
 
@@ -766,6 +913,8 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
 {
     irc_config probe;
     irc_privmsg parsed_message;
+    const char *question = NULL;
+    const char *reply_target = NULL;
     unsigned int parsed = 0;
     char encoded[128];
 
@@ -787,18 +936,33 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
 
     irc_test(strcmp("irc", "irc") == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MAJOR == 0, result);
-    irc_test(SQUIRE_IRC_VERSION_MINOR == 3, result);
+    irc_test(SQUIRE_IRC_VERSION_MINOR == 4, result);
     irc_test(SQUIRE_IRC_VERSION_PATCH == 0, result);
     irc_test(irc_parse_uint("6697", 1, 65535, &parsed) == 0 && parsed == 6697, result);
     irc_test(irc_parse_uint("0", 1, 65535, &parsed) != 0, result);
     irc_test(irc_copy_text(probe.nick, sizeof(probe.nick), "squire") == 0, result);
     irc_test(irc_config_valid(&probe), result);
     irc_test(irc_build_sasl_plain(&probe, encoded, sizeof(encoded)) == 0 && encoded[0] != '\0', result);
-    irc_test(irc_parse_privmsg(":Poe!user@example PRIVMSG ##rosaic :hello Squire",
+    irc_test(irc_parse_privmsg(":Poe!user@example PRIVMSG ##rosaic :Squire: hello",
                                &parsed_message) == 0 &&
              strcmp(parsed_message.sender, "Poe") == 0 &&
-             strcmp(parsed_message.target, "##rosaic") == 0 &&
-             strcmp(parsed_message.message, "hello Squire") == 0,
+             strcmp(parsed_message.target, "##rosaic") == 0,
+             result);
+    irc_test(irc_message_for_squire(&probe,
+                                    &parsed_message,
+                                    &question,
+                                    &reply_target) &&
+             strcmp(question, "hello") == 0 &&
+             strcmp(reply_target, "##rosaic") == 0,
+             result);
+    irc_test(irc_parse_privmsg(":Poe!user@example PRIVMSG squire :hello",
+                               &parsed_message) == 0 &&
+             irc_message_for_squire(&probe,
+                                    &parsed_message,
+                                    &question,
+                                    &reply_target) &&
+             strcmp(question, "hello") == 0 &&
+             strcmp(reply_target, "Poe") == 0,
              result);
     irc_test(irc_parse_privmsg("PING :server", &parsed_message) != 0, result);
     irc_test(irc_sasl_failure_numeric(":server 904 squire :SASL failed") == 904, result);
@@ -818,10 +982,13 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
 
 static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
 {
-    (void)host;
-
     if (irc_started) {
         return STNLABZ_MODULE_ERR_INVALID_STATE;
+    }
+
+    if (host == NULL || host->invoke_service == NULL) {
+        irc_log("START_FAIL reason=host_service_unavailable");
+        return STNLABZ_MODULE_ERR_START_FAILED;
     }
 
     if (irc_load_config(IRC_CONFIG_PATH, &irc_runtime_config) != 0) {
@@ -829,12 +996,14 @@ static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
         return STNLABZ_MODULE_ERR_START_FAILED;
     }
 
-    irc_log("START version=0.3.0 config=%s", IRC_CONFIG_PATH);
+    irc_host = host;
+    irc_log("START version=0.4.0 config=%s", IRC_CONFIG_PATH);
     irc_stop_requested = 0;
     irc_set_current_socket(-1);
 
     if (pthread_create(&irc_thread, NULL, irc_worker, &irc_runtime_config) != 0) {
         irc_log("START_FAIL reason=thread_create");
+        irc_host = NULL;
         memset(&irc_runtime_config, 0, sizeof(irc_runtime_config));
         return STNLABZ_MODULE_ERR_START_FAILED;
     }
@@ -855,6 +1024,7 @@ static stnlabz_module_result_t irc_stop(void)
     (void)pthread_join(irc_thread, NULL);
 
     irc_set_current_socket(-1);
+    irc_host = NULL;
     memset(&irc_runtime_config, 0, sizeof(irc_runtime_config));
     irc_started = 0;
     irc_log("STOP_COMPLETE");
