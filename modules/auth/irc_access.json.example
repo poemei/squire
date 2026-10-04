@@ -1,14 +1,18 @@
 {
   "version": 1,
-  "channel": "##rosaic",
-  "accounts": [
+  "channels": [
     {
-      "account": "STN_Boss",
-      "permissions": ["op"]
-    },
-    {
-      "account": "M_Rowan",
-      "permissions": ["op"]
+      "channel": "##rosaic",
+      "accounts": [
+        {
+          "account": "STN_Boss",
+          "permissions": ["op"]
+        },
+        {
+          "account": "M_Rowan",
+          "permissions": ["op"]
+        }
+      ]
     }
   ]
 }
