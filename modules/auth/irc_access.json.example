@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "channel": "##rosaic",
+  "accounts": [
+    {
+      "account": "STN_Boss",
+      "permissions": ["op"]
+    }
+  ]
+}
