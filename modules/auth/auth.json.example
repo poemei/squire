@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "account": "STN_Boss",
+      "channel": "##rosaic",
+      "permissions": ["op"]
+    },
+    {
+      "account": "M_Rowan",
+      "channel": "##rosaic",
+      "permissions": ["op"]
+    }
+  ]
+}
