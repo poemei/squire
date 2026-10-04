@@ -7,11 +7,15 @@
  * for doctrine/RAG inspection. Credentials and SASL payloads are never logged.
  *
  * IRC remains transport-only. Addressed questions are routed through Core to
- * the named rosaic.query service; this module contains no Rosaic doctrine.
+ * rosaic.query. IRC operator requests are routed through Core to
+ * irc.access.check and are authorized only from the authenticated IRCv3
+ * account tag attached to the requesting PRIVMSG.
  */
 #include "module.h"
 #include "rosaic_query.h"
+#include "irc_access.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <netdb.h>
 #include <openssl/err.h>
@@ -29,7 +33,7 @@
 #include <unistd.h>
 
 #define SQUIRE_IRC_VERSION_MAJOR 0
-#define SQUIRE_IRC_VERSION_MINOR 4
+#define SQUIRE_IRC_VERSION_MINOR 5
 #define SQUIRE_IRC_VERSION_PATCH 0
 
 #define IRC_CONFIG_PATH "/opt/squire/config/irc.conf"
@@ -39,6 +43,7 @@
 #define IRC_SASL_RAW_MAX 768
 #define IRC_SASL_B64_MAX 1024
 #define IRC_SENDER_MAX 128
+#define IRC_ACCOUNT_MAX 128
 #define IRC_MESSAGE_MAX 512
 
 typedef struct irc_config {
@@ -54,6 +59,7 @@ typedef struct irc_config {
 
 typedef struct irc_privmsg {
     char sender[IRC_SENDER_MAX];
+    char account[IRC_ACCOUNT_MAX];
     char target[IRC_TEXT_MAX];
     char message[IRC_MESSAGE_MAX];
 } irc_privmsg;
@@ -75,18 +81,10 @@ static void irc_log(const char *format, ...)
     char timestamp[64];
     va_list arguments;
 
-    if (format == NULL) {
-        return;
-    }
-
+    if (format == NULL) return;
     now = time(NULL);
-    if (localtime_r(&now, &local_tm) == NULL) {
-        return;
-    }
-
-    if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S%z", &local_tm) == 0) {
-        return;
-    }
+    if (localtime_r(&now, &local_tm) == NULL) return;
+    if (strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S%z", &local_tm) == 0) return;
 
     pthread_mutex_lock(&irc_log_lock);
     file = fopen(IRC_LOG_PATH, "a");
@@ -107,10 +105,7 @@ static void irc_log_tls_error(const char *operation, SSL *ssl, int ssl_result)
     char detail[256];
     int ssl_error = SSL_ERROR_NONE;
 
-    if (ssl != NULL && ssl_result <= 0) {
-        ssl_error = SSL_get_error(ssl, ssl_result);
-    }
-
+    if (ssl != NULL && ssl_result <= 0) ssl_error = SSL_get_error(ssl, ssl_result);
     code = ERR_get_error();
     if (code != 0UL) {
         ERR_error_string_n(code, detail, sizeof(detail));
@@ -123,26 +118,17 @@ static void irc_log_tls_error(const char *operation, SSL *ssl, int ssl_result)
 static void irc_test(int condition, stnlabz_module_qualification_result_t *result)
 {
     result->tests_executed++;
-    if (condition) {
-        result->tests_passed++;
-    } else {
-        result->tests_failed++;
-    }
+    if (condition) result->tests_passed++;
+    else result->tests_failed++;
 }
 
 static int irc_copy_text(char *destination, size_t destination_size, const char *source)
 {
     size_t length;
 
-    if (destination == NULL || destination_size == 0 || source == NULL) {
-        return -1;
-    }
-
+    if (destination == NULL || destination_size == 0 || source == NULL) return -1;
     length = strlen(source);
-    if (length == 0 || length >= destination_size) {
-        return -1;
-    }
-
+    if (length == 0 || length >= destination_size) return -1;
     memcpy(destination, source, length + 1);
     return 0;
 }
@@ -153,10 +139,7 @@ static int irc_copy_span(char *destination,
                          size_t length)
 {
     if (destination == NULL || destination_size == 0 || start == NULL ||
-        length == 0 || length >= destination_size) {
-        return -1;
-    }
-
+        length == 0 || length >= destination_size) return -1;
     memcpy(destination, start, length);
     destination[length] = '\0';
     return 0;
@@ -166,14 +149,8 @@ static char *irc_trim(char *text)
 {
     char *end;
 
-    if (text == NULL) {
-        return NULL;
-    }
-
-    while (*text == ' ' || *text == '\t') {
-        text++;
-    }
-
+    if (text == NULL) return NULL;
+    while (*text == ' ' || *text == '\t') text++;
     end = text + strlen(text);
     while (end > text &&
            (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r' || end[-1] == '\n')) {
@@ -191,16 +168,10 @@ static int irc_parse_uint(const char *text,
     char *end = NULL;
     unsigned long parsed;
 
-    if (text == NULL || value == NULL || text[0] == '\0') {
-        return -1;
-    }
-
+    if (text == NULL || value == NULL || text[0] == '\0') return -1;
     errno = 0;
     parsed = strtoul(text, &end, 10);
-    if (errno != 0 || end == text || *end != '\0' || parsed < minimum || parsed > maximum) {
-        return -1;
-    }
-
+    if (errno != 0 || end == text || *end != '\0' || parsed < minimum || parsed > maximum) return -1;
     *value = (unsigned int)parsed;
     return 0;
 }
@@ -223,18 +194,13 @@ static int irc_load_config(const char *path, irc_config *config)
     FILE *file;
     char line[IRC_LINE_MAX];
 
-    if (path == NULL || config == NULL) {
-        return -1;
-    }
-
+    if (path == NULL || config == NULL) return -1;
     memset(config, 0, sizeof(*config));
     config->port = 6697;
     config->reconnect_seconds = 180;
 
     file = fopen(path, "r");
-    if (file == NULL) {
-        return -1;
-    }
+    if (file == NULL) return -1;
 
     while (fgets(line, sizeof(line), file) != NULL) {
         char *text = irc_trim(line);
@@ -242,15 +208,9 @@ static int irc_load_config(const char *path, irc_config *config)
         char *key;
         char *value;
 
-        if (text == NULL || text[0] == '\0' || text[0] == '#') {
-            continue;
-        }
-
+        if (text == NULL || text[0] == '\0' || text[0] == '#') continue;
         equals = strchr(text, '=');
-        if (equals == NULL) {
-            fclose(file);
-            return -1;
-        }
+        if (equals == NULL) goto invalid;
 
         *equals = '\0';
         key = irc_trim(text);
@@ -297,8 +257,8 @@ static int irc_tcp_connect(const char *server, unsigned int port)
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-
     snprintf(port_text, sizeof(port_text), "%u", port);
+
     if (getaddrinfo(server, port_text, &hints, &addresses) != 0) {
         irc_log("TCP_RESOLVE_FAIL server=%s", server);
         return -1;
@@ -306,26 +266,15 @@ static int irc_tcp_connect(const char *server, unsigned int port)
 
     for (address = addresses; address != NULL; address = address->ai_next) {
         fd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
-        if (fd < 0) {
-            continue;
-        }
-
-        if (connect(fd, address->ai_addr, address->ai_addrlen) == 0) {
-            break;
-        }
-
+        if (fd < 0) continue;
+        if (connect(fd, address->ai_addr, address->ai_addrlen) == 0) break;
         close(fd);
         fd = -1;
     }
 
     freeaddrinfo(addresses);
-
-    if (fd < 0) {
-        irc_log("TCP_CONNECT_FAIL server=%s port=%u", server, port);
-    } else {
-        irc_log("TCP_CONNECT_SUCCESS server=%s port=%u", server, port);
-    }
-
+    if (fd < 0) irc_log("TCP_CONNECT_FAIL server=%s port=%u", server, port);
+    else irc_log("TCP_CONNECT_SUCCESS server=%s port=%u", server, port);
     return fd;
 }
 
@@ -339,9 +288,7 @@ static void irc_set_current_socket(int fd)
 static void irc_interrupt_socket(void)
 {
     pthread_mutex_lock(&irc_socket_lock);
-    if (irc_socket_fd >= 0) {
-        (void)shutdown(irc_socket_fd, SHUT_RDWR);
-    }
+    if (irc_socket_fd >= 0) (void)shutdown(irc_socket_fd, SHUT_RDWR);
     pthread_mutex_unlock(&irc_socket_lock);
 }
 
@@ -350,10 +297,7 @@ static int irc_ssl_send(SSL *ssl, const char *text)
     size_t length;
     size_t sent = 0;
 
-    if (ssl == NULL || text == NULL) {
-        return -1;
-    }
-
+    if (ssl == NULL || text == NULL) return -1;
     length = strlen(text);
     while (sent < length) {
         int result = SSL_write(ssl, text + sent, (int)(length - sent));
@@ -363,7 +307,6 @@ static int irc_ssl_send(SSL *ssl, const char *text)
         }
         sent += (size_t)result;
     }
-
     return 0;
 }
 
@@ -372,15 +315,9 @@ static int irc_send_command(SSL *ssl, const char *format, const char *value)
     char buffer[IRC_LINE_MAX];
     int length;
 
-    if (ssl == NULL || format == NULL || value == NULL) {
-        return -1;
-    }
-
+    if (ssl == NULL || format == NULL || value == NULL) return -1;
     length = snprintf(buffer, sizeof(buffer), format, value);
-    if (length < 0 || length >= (int)sizeof(buffer)) {
-        return -1;
-    }
-
+    if (length < 0 || length >= (int)sizeof(buffer)) return -1;
     return irc_ssl_send(ssl, buffer);
 }
 
@@ -394,38 +331,60 @@ static int irc_build_sasl_plain(const irc_config *config,
     size_t raw_length;
     int encoded_length;
 
-    if (config == NULL || encoded == NULL || encoded_size == 0) {
-        return -1;
-    }
-
+    if (config == NULL || encoded == NULL || encoded_size == 0) return -1;
     account_length = strlen(config->account);
     password_length = strlen(config->password);
     raw_length = 1 + account_length + 1 + password_length;
-
-    if (raw_length > sizeof(raw)) {
-        return -1;
-    }
+    if (raw_length > sizeof(raw)) return -1;
 
     raw[0] = '\0';
     memcpy(raw + 1, config->account, account_length);
     raw[1 + account_length] = '\0';
     memcpy(raw + 1 + account_length + 1, config->password, password_length);
 
-    if (((raw_length + 2) / 3) * 4 + 1 > encoded_size) {
-        return -1;
-    }
-
+    if (((raw_length + 2) / 3) * 4 + 1 > encoded_size) return -1;
     encoded_length = EVP_EncodeBlock((unsigned char *)encoded, raw, (int)raw_length);
-    if (encoded_length <= 0 || (size_t)encoded_length >= encoded_size) {
-        return -1;
+    if (encoded_length <= 0 || (size_t)encoded_length >= encoded_size) return -1;
+    encoded[encoded_length] = '\0';
+    return 0;
+}
+
+static int irc_tag_account(const char *tags, char *account, size_t account_size)
+{
+    const char *cursor;
+
+    if (account == NULL || account_size == 0) return -1;
+    account[0] = '\0';
+    if (tags == NULL || tags[0] == '\0') return 0;
+
+    cursor = tags;
+    while (*cursor != '\0') {
+        const char *end = strchr(cursor, ';');
+        const char *equals;
+        size_t item_length = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+
+        equals = memchr(cursor, '=', item_length);
+        if (equals != NULL && (size_t)(equals - cursor) == 7 && strncmp(cursor, "account", 7) == 0) {
+            size_t value_length = item_length - (size_t)(equals - cursor) - 1;
+            if (value_length == 0 || value_length >= account_size) return -1;
+            memcpy(account, equals + 1, value_length);
+            account[value_length] = '\0';
+            if (strcmp(account, "*") == 0) account[0] = '\0';
+            return 0;
+        }
+
+        if (end == NULL) break;
+        cursor = end + 1;
     }
 
-    encoded[encoded_length] = '\0';
     return 0;
 }
 
 static int irc_parse_privmsg(const char *line, irc_privmsg *message)
 {
+    const char *cursor;
+    const char *tags_start = NULL;
+    const char *tags_end = NULL;
     const char *prefix_start;
     const char *prefix_end;
     const char *sender_end;
@@ -433,37 +392,38 @@ static int irc_parse_privmsg(const char *line, irc_privmsg *message)
     const char *target_start;
     const char *target_end;
     const char *message_start;
+    char tags[IRC_LINE_MAX];
 
-    if (line == NULL || message == NULL || line[0] != ':') {
-        return -1;
-    }
-
+    if (line == NULL || message == NULL) return -1;
     memset(message, 0, sizeof(*message));
-    prefix_start = line + 1;
-    prefix_end = strchr(prefix_start, ' ');
-    if (prefix_end == NULL) {
-        return -1;
+    cursor = line;
+
+    if (*cursor == '@') {
+        tags_start = cursor + 1;
+        tags_end = strchr(tags_start, ' ');
+        if (tags_end == NULL) return -1;
+        if ((size_t)(tags_end - tags_start) >= sizeof(tags)) return -1;
+        memcpy(tags, tags_start, (size_t)(tags_end - tags_start));
+        tags[tags_end - tags_start] = '\0';
+        if (irc_tag_account(tags, message->account, sizeof(message->account)) != 0) return -1;
+        cursor = tags_end + 1;
     }
+
+    if (*cursor != ':') return -1;
+    prefix_start = cursor + 1;
+    prefix_end = strchr(prefix_start, ' ');
+    if (prefix_end == NULL) return -1;
 
     command = prefix_end + 1;
-    if (strncmp(command, "PRIVMSG ", 8) != 0) {
-        return -1;
-    }
+    if (strncmp(command, "PRIVMSG ", 8) != 0) return -1;
 
     sender_end = strchr(prefix_start, '!');
-    if (sender_end == NULL || sender_end > prefix_end) {
-        sender_end = prefix_end;
-    }
+    if (sender_end == NULL || sender_end > prefix_end) sender_end = prefix_end;
 
     target_start = command + 8;
     target_end = strchr(target_start, ' ');
-    if (target_end == NULL || target_end == target_start) {
-        return -1;
-    }
-
-    if (target_end[1] != ':' || target_end[2] == '\0') {
-        return -1;
-    }
+    if (target_end == NULL || target_end == target_start) return -1;
+    if (target_end[1] != ':' || target_end[2] == '\0') return -1;
     message_start = target_end + 2;
 
     if (irc_copy_span(message->sender,
@@ -476,9 +436,7 @@ static int irc_parse_privmsg(const char *line, irc_privmsg *message)
                       (size_t)(target_end - target_start)) != 0 ||
         irc_copy_text(message->message,
                       sizeof(message->message),
-                      message_start) != 0) {
-        return -1;
-    }
+                      message_start) != 0) return -1;
 
     return 0;
 }
@@ -491,9 +449,7 @@ static int irc_message_for_squire(const irc_config *config,
     size_t nick_length;
     const char *text;
 
-    if (config == NULL || privmsg == NULL || question == NULL || reply_target == NULL) {
-        return 0;
-    }
+    if (config == NULL || privmsg == NULL || question == NULL || reply_target == NULL) return 0;
 
     if (strcasecmp(privmsg->target, config->nick) == 0) {
         *question = privmsg->message;
@@ -501,27 +457,14 @@ static int irc_message_for_squire(const irc_config *config,
         return privmsg->message[0] != '\0';
     }
 
-    if (strcmp(privmsg->target, config->channel) != 0) {
-        return 0;
-    }
-
+    if (strcmp(privmsg->target, config->channel) != 0) return 0;
     nick_length = strlen(config->nick);
-    if (strncasecmp(privmsg->message, config->nick, nick_length) != 0) {
-        return 0;
-    }
+    if (strncasecmp(privmsg->message, config->nick, nick_length) != 0) return 0;
 
     text = privmsg->message + nick_length;
-    if (*text != '\0' && *text != ':' && *text != ',' && *text != ' ' && *text != '\t') {
-        return 0;
-    }
-
-    while (*text == ':' || *text == ',' || *text == ' ' || *text == '\t') {
-        text++;
-    }
-
-    if (*text == '\0') {
-        return 0;
-    }
+    if (*text != '\0' && *text != ':' && *text != ',' && *text != ' ' && *text != '\t') return 0;
+    while (*text == ':' || *text == ',' || *text == ' ' || *text == '\t') text++;
+    if (*text == '\0') return 0;
 
     *question = text;
     *reply_target = privmsg->target;
@@ -531,15 +474,9 @@ static int irc_message_for_squire(const irc_config *config,
 static void irc_sanitize_reply(char *text)
 {
     char *cursor;
-
-    if (text == NULL) {
-        return;
-    }
-
+    if (text == NULL) return;
     for (cursor = text; *cursor != '\0'; cursor++) {
-        if (*cursor == '\r' || *cursor == '\n') {
-            *cursor = ' ';
-        }
+        if (*cursor == '\r' || *cursor == '\n') *cursor = ' ';
     }
 }
 
@@ -548,17 +485,111 @@ static int irc_send_privmsg(SSL *ssl, const char *target, const char *message)
     char buffer[IRC_LINE_MAX];
     int length;
 
-    if (ssl == NULL || target == NULL || message == NULL ||
-        target[0] == '\0' || message[0] == '\0') {
-        return -1;
-    }
-
+    if (ssl == NULL || target == NULL || message == NULL || target[0] == '\0' || message[0] == '\0') return -1;
     length = snprintf(buffer, sizeof(buffer), "PRIVMSG %s :%s\r\n", target, message);
-    if (length < 0 || length >= (int)sizeof(buffer)) {
-        return -1;
+    if (length < 0 || length >= (int)sizeof(buffer)) return -1;
+    return irc_ssl_send(ssl, buffer);
+}
+
+static int irc_send_op_mode(SSL *ssl, const char *channel, const char *nick)
+{
+    char buffer[IRC_LINE_MAX];
+    int length;
+
+    if (ssl == NULL || channel == NULL || nick == NULL || channel[0] == '\0' || nick[0] == '\0') return -1;
+    length = snprintf(buffer, sizeof(buffer), "MODE %s +o %s\r\n", channel, nick);
+    if (length < 0 || length >= (int)sizeof(buffer)) return -1;
+    return irc_ssl_send(ssl, buffer);
+}
+
+static int irc_is_op_command(const irc_privmsg *privmsg)
+{
+    const char *start;
+    const char *end;
+
+    if (privmsg == NULL) return 0;
+    start = privmsg->message;
+    while (*start == ' ' || *start == '\t') start++;
+    end = start + strlen(start);
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+    return (size_t)(end - start) == 3 && strncmp(start, "!op", 3) == 0;
+}
+
+static int irc_handle_op_command(SSL *ssl,
+                                 const irc_config *config,
+                                 const irc_privmsg *privmsg)
+{
+    squire_irc_access_request request;
+    squire_irc_access_response response;
+    size_t response_used = 0;
+    stnlabz_module_result_t result;
+
+    if (!irc_is_op_command(privmsg)) return 0;
+
+    irc_log("OP_REQUEST sender=%s account=%s target=%s",
+            privmsg->sender,
+            privmsg->account[0] != '\0' ? privmsg->account : "none",
+            privmsg->target);
+
+    if (privmsg->account[0] == '\0') {
+        irc_log("OP_DENIED sender=%s reason=no_authenticated_account", privmsg->sender);
+        return 1;
     }
 
-    return irc_ssl_send(ssl, buffer);
+    if (irc_host == NULL || irc_host->invoke_service == NULL) {
+        irc_log("OP_DENIED sender=%s account=%s reason=auth_service_unavailable",
+                privmsg->sender,
+                privmsg->account);
+        return 1;
+    }
+
+    memset(&request, 0, sizeof(request));
+    memset(&response, 0, sizeof(response));
+
+    if (snprintf(request.account, sizeof(request.account), "%s", privmsg->account) >= (int)sizeof(request.account) ||
+        snprintf(request.channel, sizeof(request.channel), "%s", config->channel) >= (int)sizeof(request.channel) ||
+        snprintf(request.permission, sizeof(request.permission), "%s", "op") >= (int)sizeof(request.permission)) {
+        irc_log("OP_DENIED sender=%s account=%s reason=request_too_long",
+                privmsg->sender,
+                privmsg->account);
+        return 1;
+    }
+
+    result = irc_host->invoke_service(SQUIRE_IRC_ACCESS_SERVICE,
+                                      &request,
+                                      sizeof(request),
+                                      &response,
+                                      sizeof(response),
+                                      &response_used);
+    if (result != STNLABZ_MODULE_OK || response_used != sizeof(response)) {
+        irc_log("OP_DENIED sender=%s account=%s reason=auth_service_error result=%d",
+                privmsg->sender,
+                privmsg->account,
+                (int)result);
+        return 1;
+    }
+
+    if (!response.allowed) {
+        irc_log("OP_DENIED sender=%s account=%s channel=%s permission=op",
+                privmsg->sender,
+                privmsg->account,
+                config->channel);
+        return 1;
+    }
+
+    if (irc_send_op_mode(ssl, config->channel, privmsg->sender) != 0) {
+        irc_log("OP_MODE_SEND_FAIL sender=%s account=%s channel=%s",
+                privmsg->sender,
+                privmsg->account,
+                config->channel);
+        return 1;
+    }
+
+    irc_log("OP_MODE_SENT sender=%s account=%s channel=%s permission=op",
+            privmsg->sender,
+            privmsg->account,
+            config->channel);
+    return 1;
 }
 
 static int irc_route_query(SSL *ssl,
@@ -572,9 +603,7 @@ static int irc_route_query(SSL *ssl,
     size_t response_used = 0;
     stnlabz_module_result_t result;
 
-    if (!irc_message_for_squire(config, privmsg, &question, &reply_target)) {
-        return 0;
-    }
+    if (!irc_message_for_squire(config, privmsg, &question, &reply_target)) return 0;
 
     if (irc_host == NULL || irc_host->invoke_service == NULL) {
         irc_log("QUERY_ROUTE_FAIL reason=host_service_unavailable sender=%s", privmsg->sender);
@@ -584,12 +613,9 @@ static int irc_route_query(SSL *ssl,
     memset(&request, 0, sizeof(request));
     memset(&response, 0, sizeof(response));
 
-    if (snprintf(request.sender, sizeof(request.sender), "%s", privmsg->sender) >=
-            (int)sizeof(request.sender) ||
-        snprintf(request.target, sizeof(request.target), "%s", privmsg->target) >=
-            (int)sizeof(request.target) ||
-        snprintf(request.question, sizeof(request.question), "%s", question) >=
-            (int)sizeof(request.question)) {
+    if (snprintf(request.sender, sizeof(request.sender), "%s", privmsg->sender) >= (int)sizeof(request.sender) ||
+        snprintf(request.target, sizeof(request.target), "%s", privmsg->target) >= (int)sizeof(request.target) ||
+        snprintf(request.question, sizeof(request.question), "%s", question) >= (int)sizeof(request.question)) {
         irc_log("QUERY_ROUTE_FAIL reason=request_too_long sender=%s", privmsg->sender);
         return -1;
     }
@@ -600,9 +626,7 @@ static int irc_route_query(SSL *ssl,
                                       &response,
                                       sizeof(response),
                                       &response_used);
-    if (result != STNLABZ_MODULE_OK ||
-        response_used != sizeof(response) ||
-        response.text[0] == '\0') {
+    if (result != STNLABZ_MODULE_OK || response_used != sizeof(response) || response.text[0] == '\0') {
         irc_log("QUERY_ROUTE_FAIL service=%s result=%d sender=%s",
                 SQUIRE_ROSAIC_QUERY_SERVICE,
                 (int)result,
@@ -638,7 +662,9 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
     char read_buffer[4096];
     char line_buffer[IRC_LINE_MAX];
     size_t line_used = 0;
-    int sasl_requested = 0;
+    int capabilities_requested = 0;
+    int account_tag_acked = 0;
+    int sasl_acked = 0;
     int sasl_payload_sent = 0;
     int sasl_complete = 0;
     int welcome_seen = 0;
@@ -660,8 +686,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                               "USER %s 0 * :%s\r\n",
                               config->nick,
                               config->realname);
-        if (length < 0 || length >= (int)sizeof(user_line) ||
-            irc_ssl_send(ssl, user_line) != 0) {
+        if (length < 0 || length >= (int)sizeof(user_line) || irc_ssl_send(ssl, user_line) != 0) {
             irc_log("IRC_USER_SEND_FAIL");
             return -1;
         }
@@ -679,10 +704,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
         for (index = 0; index < count; index++) {
             char character = read_buffer[index];
 
-            if (character == '\r') {
-                continue;
-            }
-
+            if (character == '\r') continue;
             if (character != '\n') {
                 if (line_used + 1 >= sizeof(line_buffer)) {
                     irc_log("IRC_LINE_TOO_LONG");
@@ -697,36 +719,43 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
             {
                 irc_privmsg privmsg;
                 if (irc_parse_privmsg(line_buffer, &privmsg) == 0) {
-                    irc_log("PRIVMSG sender=%s target=%s message=%s",
+                    irc_log("PRIVMSG sender=%s account=%s target=%s message=%s",
                             privmsg.sender,
+                            privmsg.account[0] != '\0' ? privmsg.account : "none",
                             privmsg.target,
                             privmsg.message);
-                    (void)irc_route_query(ssl, config, &privmsg);
+                    if (!irc_handle_op_command(ssl, config, &privmsg)) {
+                        (void)irc_route_query(ssl, config, &privmsg);
+                    }
                 }
             }
 
             if (strncmp(line_buffer, "PING ", 5) == 0) {
                 char pong[IRC_LINE_MAX];
                 int length = snprintf(pong, sizeof(pong), "PONG %s\r\n", line_buffer + 5);
-                if (length < 0 || length >= (int)sizeof(pong) || irc_ssl_send(ssl, pong) != 0) {
-                    return -1;
-                }
+                if (length < 0 || length >= (int)sizeof(pong) || irc_ssl_send(ssl, pong) != 0) return -1;
             }
 
-            if (!sasl_requested && strstr(line_buffer, " CAP ") != NULL &&
-                strstr(line_buffer, " LS ") != NULL && strstr(line_buffer, "sasl") != NULL) {
-                irc_log("SASL_CAPABILITY_FOUND");
-                if (irc_ssl_send(ssl, "CAP REQ :sasl\r\n") != 0) {
+            if (!capabilities_requested && strstr(line_buffer, " CAP ") != NULL &&
+                strstr(line_buffer, " LS ") != NULL) {
+                if (strstr(line_buffer, "sasl") == NULL || strstr(line_buffer, "account-tag") == NULL) {
+                    irc_log("CAPABILITY_REQUIRED_MISSING sasl=%s account_tag=%s",
+                            strstr(line_buffer, "sasl") != NULL ? "yes" : "no",
+                            strstr(line_buffer, "account-tag") != NULL ? "yes" : "no");
                     return -1;
                 }
-                sasl_requested = 1;
+                if (irc_ssl_send(ssl, "CAP REQ :sasl account-tag\r\n") != 0) return -1;
+                capabilities_requested = 1;
+                irc_log("CAPABILITY_REQUESTED sasl account-tag");
             }
 
-            if (sasl_requested && strstr(line_buffer, " CAP ") != NULL &&
-                strstr(line_buffer, " ACK ") != NULL && strstr(line_buffer, "sasl") != NULL) {
-                irc_log("SASL_CAPABILITY_ACK");
-                if (irc_ssl_send(ssl, "AUTHENTICATE PLAIN\r\n") != 0) {
-                    return -1;
+            if (capabilities_requested && strstr(line_buffer, " CAP ") != NULL &&
+                strstr(line_buffer, " ACK ") != NULL) {
+                if (strstr(line_buffer, "sasl") != NULL) sasl_acked = 1;
+                if (strstr(line_buffer, "account-tag") != NULL) account_tag_acked = 1;
+                if (sasl_acked && account_tag_acked) {
+                    irc_log("CAPABILITY_ACK sasl account-tag");
+                    if (irc_ssl_send(ssl, "AUTHENTICATE PLAIN\r\n") != 0) return -1;
                 }
             }
 
@@ -741,8 +770,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 }
 
                 length = snprintf(authenticate, sizeof(authenticate), "AUTHENTICATE %s\r\n", encoded);
-                if (length < 0 || length >= (int)sizeof(authenticate) ||
-                    irc_ssl_send(ssl, authenticate) != 0) {
+                if (length < 0 || length >= (int)sizeof(authenticate) || irc_ssl_send(ssl, authenticate) != 0) {
                     irc_log("SASL_PAYLOAD_SEND_FAIL");
                     return -1;
                 }
@@ -753,9 +781,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
             if (strstr(line_buffer, " 903 ") != NULL) {
                 sasl_complete = 1;
                 irc_log("SASL_SUCCESS account=%s", config->account);
-                if (irc_ssl_send(ssl, "CAP END\r\n") != 0) {
-                    return -1;
-                }
+                if (irc_ssl_send(ssl, "CAP END\r\n") != 0) return -1;
             }
 
             {
@@ -771,7 +797,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 irc_log("IRC_WELCOME nick=%s", config->nick);
             }
 
-            if (!join_sent && sasl_complete && welcome_seen) {
+            if (!join_sent && sasl_complete && welcome_seen && account_tag_acked) {
                 if (irc_send_command(ssl, "JOIN %s\r\n", config->channel) != 0) {
                     irc_log("JOIN_SEND_FAIL channel=%s", config->channel);
                     return -1;
@@ -781,8 +807,7 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
             }
 
             if (join_sent && !join_confirmed && strstr(line_buffer, " JOIN ") != NULL &&
-                strstr(line_buffer, config->nick) != NULL &&
-                strstr(line_buffer, config->channel) != NULL) {
+                strstr(line_buffer, config->nick) != NULL && strstr(line_buffer, config->channel) != NULL) {
                 join_confirmed = 1;
                 irc_log("JOIN_CONFIRMED channel=%s nick=%s", config->channel, config->nick);
             }
@@ -793,6 +818,10 @@ static int irc_handle_session(SSL *ssl, const irc_config *config)
                 strstr(line_buffer, " 475 ") != NULL ||
                 strstr(line_buffer, " 477 ") != NULL) {
                 irc_log("JOIN_REJECTED channel=%s", config->channel);
+            }
+
+            if (strstr(line_buffer, " 482 ") != NULL) {
+                irc_log("OP_MODE_REJECTED reason=not_channel_operator");
             }
 
             line_used = 0;
@@ -811,11 +840,8 @@ static int irc_connect_once(const irc_config *config)
     int ssl_result;
 
     irc_log("CONNECT_BEGIN server=%s port=%u", config->server, config->port);
-
     fd = irc_tcp_connect(config->server, config->port);
-    if (fd < 0) {
-        return -1;
-    }
+    if (fd < 0) return -1;
 
     irc_set_current_socket(fd);
     ERR_clear_error();
@@ -864,26 +890,17 @@ cleanup:
         (void)SSL_shutdown(ssl);
         SSL_free(ssl);
     }
-    if (context != NULL) {
-        SSL_CTX_free(context);
-    }
-
+    if (context != NULL) SSL_CTX_free(context);
     irc_set_current_socket(-1);
-    if (fd >= 0) {
-        close(fd);
-    }
-
+    if (fd >= 0) close(fd);
     return result;
 }
 
 static void irc_sleep_reconnect(unsigned int seconds)
 {
     unsigned int elapsed;
-
     irc_log("RECONNECT_WAIT seconds=%u", seconds);
-    for (elapsed = 0; elapsed < seconds && !irc_stop_requested; elapsed++) {
-        sleep(1);
-    }
+    for (elapsed = 0; elapsed < seconds && !irc_stop_requested; elapsed++) sleep(1);
 }
 
 static void *irc_worker(void *context)
@@ -891,13 +908,14 @@ static void *irc_worker(void *context)
     irc_config *config = (irc_config *)context;
 
     irc_log("WORKER_START server=%s channel=%s nick=%s account=%s",
-            config->server, config->channel, config->nick, config->account);
+            config->server,
+            config->channel,
+            config->nick,
+            config->account);
 
     while (!irc_stop_requested) {
         (void)irc_connect_once(config);
-        if (!irc_stop_requested) {
-            irc_sleep_reconnect(config->reconnect_seconds);
-        }
+        if (!irc_stop_requested) irc_sleep_reconnect(config->reconnect_seconds);
     }
 
     irc_log("WORKER_STOP");
@@ -918,10 +936,7 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
     unsigned int parsed = 0;
     char encoded[128];
 
-    if (result == NULL) {
-        return STNLABZ_MODULE_ERR_INVALID_ARGUMENT;
-    }
-
+    if (result == NULL) return STNLABZ_MODULE_ERR_INVALID_ARGUMENT;
     memset(result, 0, sizeof(*result));
     memset(&probe, 0, sizeof(probe));
 
@@ -936,36 +951,39 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
 
     irc_test(strcmp("irc", "irc") == 0, result);
     irc_test(SQUIRE_IRC_VERSION_MAJOR == 0, result);
-    irc_test(SQUIRE_IRC_VERSION_MINOR == 4, result);
+    irc_test(SQUIRE_IRC_VERSION_MINOR == 5, result);
     irc_test(SQUIRE_IRC_VERSION_PATCH == 0, result);
     irc_test(irc_parse_uint("6697", 1, 65535, &parsed) == 0 && parsed == 6697, result);
     irc_test(irc_parse_uint("0", 1, 65535, &parsed) != 0, result);
-    irc_test(irc_copy_text(probe.nick, sizeof(probe.nick), "squire") == 0, result);
     irc_test(irc_config_valid(&probe), result);
     irc_test(irc_build_sasl_plain(&probe, encoded, sizeof(encoded)) == 0 && encoded[0] != '\0', result);
-    irc_test(irc_parse_privmsg(":Poe!user@example PRIVMSG ##rosaic :Squire: hello",
+    irc_test(irc_parse_privmsg("@account=STN_Boss :Poe!user@example PRIVMSG ##rosaic :!op",
                                &parsed_message) == 0 &&
              strcmp(parsed_message.sender, "Poe") == 0 &&
-             strcmp(parsed_message.target, "##rosaic") == 0,
+             strcmp(parsed_message.account, "STN_Boss") == 0 &&
+             strcmp(parsed_message.target, "##rosaic") == 0 &&
+             irc_is_op_command(&parsed_message),
              result);
-    irc_test(irc_message_for_squire(&probe,
-                                    &parsed_message,
-                                    &question,
-                                    &reply_target) &&
-             strcmp(question, "hello") == 0 &&
-             strcmp(reply_target, "##rosaic") == 0,
+    irc_test(irc_parse_privmsg("@account=M_Rowan :Rowan!user@example PRIVMSG squire :hello",
+                               &parsed_message) == 0 &&
+             strcmp(parsed_message.account, "M_Rowan") == 0,
              result);
-    irc_test(irc_parse_privmsg(":Poe!user@example PRIVMSG squire :hello",
+    irc_test(irc_parse_privmsg(":Guest!user@example PRIVMSG ##rosaic :!op",
+                               &parsed_message) == 0 &&
+             parsed_message.account[0] == '\0',
+             result);
+    irc_test(irc_parse_privmsg("@account=STN_Boss :Poe!user@example PRIVMSG ##rosaic :Squire: hello",
                                &parsed_message) == 0 &&
              irc_message_for_squire(&probe,
                                     &parsed_message,
                                     &question,
                                     &reply_target) &&
              strcmp(question, "hello") == 0 &&
-             strcmp(reply_target, "Poe") == 0,
+             strcmp(reply_target, "##rosaic") == 0,
              result);
     irc_test(irc_parse_privmsg("PING :server", &parsed_message) != 0, result);
     irc_test(irc_sasl_failure_numeric(":server 904 squire :SASL failed") == 904, result);
+    irc_test(strcmp(SQUIRE_IRC_ACCESS_SERVICE, "irc.access.check") == 0, result);
     irc_test(!irc_started && irc_socket_fd == -1, result);
 
     result->negative_test_executed = 1;
@@ -982,10 +1000,7 @@ static stnlabz_module_result_t irc_qualify(stnlabz_module_qualification_result_t
 
 static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
 {
-    if (irc_started) {
-        return STNLABZ_MODULE_ERR_INVALID_STATE;
-    }
-
+    if (irc_started) return STNLABZ_MODULE_ERR_INVALID_STATE;
     if (host == NULL || host->invoke_service == NULL) {
         irc_log("START_FAIL reason=host_service_unavailable");
         return STNLABZ_MODULE_ERR_START_FAILED;
@@ -997,7 +1012,7 @@ static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
     }
 
     irc_host = host;
-    irc_log("START version=0.4.0 config=%s", IRC_CONFIG_PATH);
+    irc_log("START version=0.5.0 config=%s", IRC_CONFIG_PATH);
     irc_stop_requested = 0;
     irc_set_current_socket(-1);
 
@@ -1014,9 +1029,7 @@ static stnlabz_module_result_t irc_start(const stnlabz_module_host_t *host)
 
 static stnlabz_module_result_t irc_stop(void)
 {
-    if (!irc_started) {
-        return STNLABZ_MODULE_ERR_INVALID_STATE;
-    }
+    if (!irc_started) return STNLABZ_MODULE_ERR_INVALID_STATE;
 
     irc_log("STOP_BEGIN");
     irc_stop_requested = 1;
