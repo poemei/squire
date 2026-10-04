@@ -5,6 +5,10 @@
     {
       "account": "STN_Boss",
       "permissions": ["op"]
+    },
+    {
+      "account": "M_Rowan",
+      "permissions": ["op"]
     }
   ]
 }
